@@ -261,14 +261,20 @@ describe("spawnSupervised", () => {
 
   test("a normal exit that leaves nothing behind signals nothing and does not wait out the grace", SLOW, async () => {
     // The child's pid is free once it has exited, so with nothing left in its group even a
-    // group signal could only reach a stranger. The spy passes every call through.
-    const spy = vi.spyOn(process, "kill");
+    // group signal could only reach a stranger. process.kill is mocked, so a regression is
+    // recorded here and never sent.
+    const calls: Array<[number, unknown]> = [];
+    const spy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      calls.push([pid, signal]);
+      return true;
+    });
     try {
       const started = Date.now();
       const { sup } = supervise("", { graceMs: 20_000 });
-      expect(await sup.done).toEqual({ code: 0, signal: null, timedOut: false, reaped: 0 });
+      const result = await sup.done;
+      expect(calls).toEqual([]);
+      expect(result).toEqual({ code: 0, signal: null, timedOut: false, reaped: 0 });
       expect(Date.now() - started).toBeLessThan(10_000);
-      expect(spy).not.toHaveBeenCalled();
     } finally {
       spy.mockRestore();
     }

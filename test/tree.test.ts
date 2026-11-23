@@ -447,7 +447,7 @@ describe("signalTree", () => {
     const os = fakeOs(TREE, new Set([1000, 1001])); // the shell ignores TERM
     const p = plan();
     const first = signalTree(p, "SIGTERM", os.kill);
-    const r = killTreeSurvivors(p, os.kill, first);
+    const r = killTreeSurvivors(p, first, os.kill);
     expect(os.calls.filter(([, s]) => s === "SIGKILL")).toEqual([[-2000, "SIGKILL"]]);
     expect(r.signaled).toEqual([-2000]);
     expect(r.gone).toEqual([-1000]); // already dead, not signaled again
@@ -494,7 +494,7 @@ describe("signalTree", () => {
     const r = signalTree(plan(), "SIGTERM", kill);
     expect(os.calls).toEqual([]);
     expect(r).toEqual({ signaled: [], denied: [-1000], gone: [] });
-    expect(killTreeSurvivors(plan(), kill, r)).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(killTreeSurvivors(plan(), r, kill)).toEqual({ signaled: [], denied: [], gone: [] });
   });
 
   test("a refused plan signals nothing", () => {
@@ -504,7 +504,7 @@ describe("signalTree", () => {
     const os = fakeOs(table);
     const first = signalTree(refused, "SIGTERM", os.kill);
     expect(first).toEqual({ signaled: [], denied: [], gone: [] });
-    expect(killTreeSurvivors(refused, os.kill, first)).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(killTreeSurvivors(refused, first, os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
     expect(os.calls).toEqual([]);
   });
 
@@ -526,7 +526,7 @@ describe("signalTree", () => {
     expect(p.pids).not.toContain(4000);
     const os = fakeOs([...TREE, row(4000, 1, 4000)]);
     const first = signalTree(p, "SIGTERM", os.kill);
-    killTreeSurvivors(p, os.kill, first);
+    killTreeSurvivors(p, first, os.kill);
     for (const [target] of os.calls) expect(Math.abs(target)).not.toBe(4000);
     expect(os.live.has(4000)).toBe(true);
   });
@@ -551,7 +551,7 @@ describe("killTreeSurvivors after a clean first pass", () => {
       if (t === -1000) throw errno("EPERM"); // a member we may not signal now keeps the root group alive
       os.kill(t, s);
     };
-    const r = killTreeSurvivors(p, kill, first);
+    const r = killTreeSurvivors(p, first, kill);
     expect(r.denied).toEqual([-1000]);
     expect(r.signaled).toEqual([-2000]);
     expect(os.live.has(2002)).toBe(false);
@@ -560,7 +560,7 @@ describe("killTreeSurvivors after a clean first pass", () => {
   test("a first pass that was denied on the root group means nothing is sent", () => {
     const os = fakeOs(TREE);
     const p = planTreeKill(1000, TREE, SELF)!;
-    const r = killTreeSurvivors(p, os.kill, { signaled: [], denied: [-1000], gone: [] });
+    const r = killTreeSurvivors(p, { signaled: [], denied: [-1000], gone: [] }, os.kill);
     expect(r).toEqual({ signaled: [], denied: [], gone: [] });
     expect(os.calls).toEqual([]);
   });
@@ -569,7 +569,7 @@ describe("killTreeSurvivors after a clean first pass", () => {
     const os = fakeOs(TREE);
     const p = planTreeKill(1000, TREE, SELF)!;
     // @ts-expect-error `first` is required: the root-EPERM gate can never be skipped by omission
-    const r = killTreeSurvivors(p, os.kill);
+    const r = killTreeSurvivors(p, undefined, os.kill);
     expect(r).toEqual({ signaled: [], denied: [], gone: [] });
     expect(os.calls).toEqual([]);
   });
@@ -583,7 +583,7 @@ describe("a kill that throws something odd", () => {
         throw thrown;
       };
       expect(() => signalTree(p, "SIGTERM", kill)).not.toThrow();
-      expect(() => killTreeSurvivors(p, kill, { signaled: [-1000], denied: [], gone: [] })).not.toThrow();
+      expect(() => killTreeSurvivors(p, { signaled: [-1000], denied: [], gone: [] }, kill)).not.toThrow();
       expect(() => processGroupAlive(1234, kill)).not.toThrow();
       expect(signalTree(p, "SIGTERM", kill).denied).toEqual([-1000]);
       expect(processGroupAlive(1234, kill)).toBe(false);

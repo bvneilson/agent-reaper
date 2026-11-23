@@ -207,10 +207,15 @@ export function spawnSupervised(command: string, args: string[], opts: Supervise
  *
  * A root that is this process, leads or sits in its group, has it beneath it,
  * or is 1 or less is refused, and nothing is signaled. So is any root when
- * the snapshot does not show this process's ancestors back to pid 1. Without
- * a usable snapshot (`snapshotTimeoutMs` 0 or less, or `ps` failing or timing
- * out) only the root's own group is signaled, and only this process and its
- * parent can be checked.
+ * the snapshot does not show this process's ancestors back to pid 1. If the
+ * snapshot no longer shows the root itself, the plan starts from the members
+ * its process group still has (POSIX never reuses a pid while a group with
+ * that id exists), under the same checks. So a group whose leader exited is
+ * still refused when it holds this process or one of its ancestors. Only
+ * without a usable snapshot (`snapshotTimeoutMs` 0 or less, `ps` failing or
+ * timing out, or a table without this process's own row) is the root's group
+ * signaled on its own, and then only this process and its parent can be
+ * checked.
  *
  * Resolves to:
  * - `"done"`: at least one target took SIGTERM, the survivors got SIGKILL
@@ -218,13 +223,25 @@ export function spawnSupervised(command: string, args: string[], opts: Supervise
  * - `"denied"`: the plan was refused, or some target could not be signaled
  *   (EPERM: it is not ours). The other targets were still signaled, unless the
  *   root's own group was the one denied, which means the tree is not ours.
- * - `"gone"`: nothing in the plan was alive to take the signal.
+ * - `"gone"`: nothing in the plan was alive to take the signal, or the
+ *   snapshot showed nothing left of the root or its group (and nothing was
+ *   sent).
  *
  * Never rejects.
  */
 export async function killTree(rootPid: number, opts: KillTreeOptions = {}): Promise<KillTreeOutcome> {
   const table = await snapshotProcessTableAsync(opts.snapshotTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS);
-  const plan = (table && planTreeKill(rootPid, table, process.pid)) ?? groupOnlyPlan(rootPid);
+  // A table without our own row is not trusted, and counts as no snapshot.
+  const trusted = table?.some((r) => r.pid === process.pid) ? table : null;
+  // A trusted snapshot is never thrown away for the group-only plan, which can
+  // check only our pid and our parent's. With the root's row absent, the
+  // rootLedGroup plan runs every check on what is left of the root's group, so
+  // a leaderless group that holds us or an ancestor is refused. Null means
+  // nothing of the root or its group is left, and nothing is sent.
+  const plan = trusted
+    ? planTreeKill(rootPid, trusted, process.pid, { rootLedGroup: true })
+    : groupOnlyPlan(rootPid);
+  if (!plan) return "gone";
   if (plan.refused) return "denied";
   const { first, last } = await killPlan(plan, "SIGTERM", graceOf(opts.graceMs));
   if (first.denied.length > 0 || (last?.denied.length ?? 0) > 0) return "denied";
@@ -322,7 +339,7 @@ async function killPlan(
   // now could only find a group or pid that was reused since.
   if (first.signaled.length === 0) return { first, last: null };
   await new Promise((resolve) => setTimeout(resolve, graceMs));
-  return { first, last: killTreeSurvivors(plan, undefined, first) };
+  return { first, last: killTreeSurvivors(plan, first) };
 }
 
 /** A delay node's timers accept, or null when `ms` asks for none. */

@@ -1,9 +1,16 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { ProcRow } from "../src/index.js";
-import { planChildKill } from "../src/spawn.js";
+import { killTree, planChildKill } from "../src/spawn.js";
+import { snapshotProcessTableAsync } from "../src/tree.js";
 
-// Pure: which plan a supervised child is killed by. No process is signaled here.
-// The fake pids sit above any real pid range, so they can never name a real process.
+// Which plan a supervised child, or a killTree root, is killed by. No process is signaled
+// here: killTree runs on an injected table with process.kill mocked. The fake pids sit above
+// any real pid range, so they could never name a real process anyway.
+
+vi.mock("../src/tree.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../src/tree.js")>();
+  return { ...real, snapshotProcessTableAsync: vi.fn(real.snapshotProcessTableAsync) };
+});
 
 const SELF = process.pid;
 const CHILD = 5_000_100;
@@ -67,5 +74,75 @@ describe("planChildKill when ps hides one of our ancestors", () => {
   test("any other refusal still signals nothing, even while the child runs", () => {
     const table = [...HIDDEN, row(CHILD, SELF, SELF)]; // the child's row sits in our own group
     expect(planChildKill(CHILD, table, true)).toMatchObject({ groups: [], pids: [], refusal: "in-our-group" });
+  });
+});
+
+describe("killTree with a snapshot that lacks the root's row", () => {
+  const calls: Array<[number, unknown]> = [];
+  /** killTree(root) planned from `table`, with every kill recorded and none sent. */
+  const run = async (root: number, table: ProcRow[] | null) => {
+    calls.length = 0;
+    vi.mocked(snapshotProcessTableAsync).mockResolvedValueOnce(table);
+    const spy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      calls.push([pid, signal]);
+      return true;
+    });
+    try {
+      return await killTree(root, { graceMs: 0 });
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  test("our own group, whose leader exited: denied, and nothing is signaled", async () => {
+    // We and our parent sit in group LEADER, and the process that led it is gone.
+    const LEADER = 5_000_450;
+    const table = [row(1, 0, 1), row(5_000_400, 1, LEADER), row(SELF, 5_000_400, LEADER)];
+    const outcome = await run(LEADER, table);
+    expect(calls).toEqual([]);
+    expect(outcome).toBe("denied");
+  });
+
+  test("an ancestor's group, whose leader exited: denied, and nothing is signaled", async () => {
+    // Our grandparent 5_000_300 sits in group 5_000_350, and the process that led it is gone.
+    const table = [
+      row(1, 0, 1),
+      row(5_000_300, 1, 5_000_350),
+      row(5_000_400, 5_000_300, 5_000_400),
+      row(SELF, 5_000_400, SELF),
+    ];
+    const outcome = await run(5_000_350, table);
+    expect(calls).toEqual([]);
+    expect(outcome).toBe("denied");
+  });
+
+  test("nothing left of the root or its group: gone, and nothing is signaled", async () => {
+    const outcome = await run(5_000_100, [...BASE, row(5_000_500, 1, 5_000_500)]);
+    expect(calls).toEqual([]);
+    expect(outcome).toBe("gone");
+  });
+
+  test("a stranger's exited root with survivors: its tree is signaled, with every exclusion intact", async () => {
+    const ROOT = 5_000_600;
+    const table = [
+      ...BASE,
+      row(5_000_610, 1, ROOT), // left in the exited root's group
+      row(5_000_620, 5_000_610, 5_000_620), // its child, in a group of its own
+      row(5_000_630, 5_000_610, SELF), // its child, in our group: by pid, never our group whole
+    ];
+    expect(await run(ROOT, table)).toBe("done");
+    expect(calls.filter(([, signal]) => signal === "SIGTERM")).toEqual([
+      [-ROOT, "SIGTERM"],
+      [-5_000_620, "SIGTERM"],
+      [5_000_630, "SIGTERM"],
+    ]);
+    for (const [target] of calls) expect([SELF, -SELF]).not.toContain(target);
+  });
+
+  test("a failed snapshot, or one without this process's own row, still means the group-only kill", async () => {
+    for (const table of [null, [row(1, 0, 1), row(5_000_710, 1, 5_000_700)]]) {
+      expect(await run(5_000_700, table)).toBe("done");
+      expect(calls.filter(([, signal]) => signal === "SIGTERM")).toEqual([[-5_000_700, "SIGTERM"]]);
+    }
   });
 });

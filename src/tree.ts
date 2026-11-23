@@ -444,13 +444,13 @@ export function signalTree(
  * root group was ours when the first signal went out, and an EPERM now (a
  * member we may not signal keeps it alive) is reported in `denied` without
  * stopping the other survivors. A `first` that is missing or malformed (only
- * possible from plain JavaScript) sends nothing. Pass `undefined` as `kill` for
- * the real `process.kill`.
+ * possible from plain JavaScript) sends nothing. `kill` defaults to
+ * `process.kill`, as in {@link signalTree}.
  */
 export function killTreeSurvivors(
   plan: TreeKillPlan,
-  kill: KillFn | undefined = defaultKill,
   first: TreeSignalResult,
+  kill: KillFn = defaultKill,
 ): TreeSignalResult {
   if (!Array.isArray(first?.denied) || first.denied.includes(-plan.rootPid)) {
     return { signaled: [], denied: [], gone: [] };
