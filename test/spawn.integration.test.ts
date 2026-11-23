@@ -36,6 +36,16 @@ const DEADLINE_MS = 10_000;
 const GRACE_MS = 500;
 const SLOW = { timeout: 30_000 };
 
+// The stop handler the README's Usage section shows, which the supervisor scripts below run.
+const STOP_PATTERN = `let stopping = false;
+const stop = (code) => {
+  if (stopping) return; // a second signal while the reap runs changes nothing
+  stopping = true;
+  run.kill().then(() => run.done).catch(() => {}).then(() => process.exit(code));
+};
+process.on("SIGINT", () => stop(130));
+process.on("SIGTERM", () => stop(143));`;
+
 const recorded = new Set<number>();
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -304,6 +314,28 @@ describe("spawnSupervised", () => {
     }
   });
 
+  test("timeoutMs: Infinity means no timeout: no timer is set, and the child is left running", SLOW, async () => {
+    const delays: unknown[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms);
+      return realSetTimeout(fn, ms);
+    }) as never);
+    let run: ReturnType<typeof supervise>;
+    try {
+      run = supervise(`console.log(JSON.stringify({ up: true })); ${SLEEP}`, { timeoutMs: Infinity });
+    } finally {
+      spy.mockRestore();
+    }
+    // Before the fix this was clamped to 2^31-1 ms, a kill after about 24.86 days.
+    expect(delays.filter((ms) => typeof ms === "number" && ms > 60_000)).toEqual([]);
+    await run.waitFor("up");
+    expect(running(run.sup.child.pid!)).toBe(true);
+    await run.sup.kill();
+    expect(await run.sup.done).toMatchObject({ timedOut: false });
+    expect(await gone(run.sup.child.pid!)).toBe(true);
+  });
+
   test("kill() with an unknown signal rejects and leaves the child supervised", SLOW, async () => {
     const { sup } = supervise(SLEEP);
     await expect(sup.kill("SIGNOPE" as NodeJS.Signals)).rejects.toThrow(TypeError);
@@ -375,6 +407,76 @@ describe("a process that awaits done", () => {
     expect((await waitFor("done")).done).toMatchObject({ timedOut: true, signal: "SIGTERM" });
     expect(existsSync(mark)).toBe(true); // the grandchild took the SIGTERM and lived through it
     expect(await gone(g)).toBe(true);
+  });
+});
+
+describe("the supervisor's own death", () => {
+  const ROOT = fileURLToPath(new URL("..", import.meta.url));
+  let dir = "";
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "reaper-supervisor-death-"));
+    const tsc = join(ROOT, "node_modules", "typescript", "bin", "tsc");
+    const project = join(ROOT, "tsconfig.build.json");
+    execFileSync(NODE, [tsc, "-p", project, "--outDir", join(dir, "lib")], { stdio: "pipe" });
+    writeFileSync(join(dir, "package.json"), '{ "type": "module" }\n');
+    const common = `import { spawnSupervised } from "./lib/index.js";
+      const run = spawnSupervised(process.execPath, ["-e", process.argv[2]], { graceMs: 500 });
+      console.log(JSON.stringify({ pids: { child: run.child.pid } }));
+      run.child.stdout.resume();
+      run.child.stderr.resume();
+      `;
+    writeFileSync(join(dir, "unhandled.mjs"), `${common}console.log(JSON.stringify({ ready: true }));\nawait run.done;\n`);
+    writeFileSync(
+      join(dir, "handled.mjs"),
+      `${common}${STOP_PATTERN}
+      console.log(JSON.stringify({ ready: true }));
+      await run.done;
+      `,
+    );
+  }, 30_000);
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Runs `script` as a supervisor of a sleeping child, interrupts the supervisor, and returns what happened. */
+  async function interrupt(script: string, signal: NodeJS.Signals) {
+    const runner = spawn(NODE, [join(dir, script), SLEEP], { stdio: ["ignore", "pipe", "pipe"] });
+    const exited = new Promise<[number | null, NodeJS.Signals | null]>((resolve) =>
+      runner.once("exit", (code, sig) => resolve([code, sig])),
+    );
+    const { waitFor } = watch(runner);
+    const { child } = await waitFor("child", "ready");
+    process.kill(runner.pid!, signal); // the supervisor only: a pid this test started
+    return { child: child as number, exit: await exited };
+  }
+
+  test("without a handler, Ctrl-C ends the supervisor and the agent keeps running", SLOW, async () => {
+    const { child, exit } = await interrupt("unhandled.mjs", "SIGINT");
+    expect(exit).toEqual([null, "SIGINT"]);
+    await sleep(1000); // longer than any reap would take with graceMs 500
+    expect(running(child)).toBe(true);
+  });
+
+  for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
+    test(`with the README pattern, ${signal} reaps the agent and the supervisor exits ${code}`, SLOW, async () => {
+      const { child, exit } = await interrupt("handled.mjs", signal);
+      expect(exit).toEqual([code, null]);
+      expect(await gone(child)).toBe(true);
+    });
+  }
+
+  test("a second signal while the reap runs is ignored: one reap, one exit", SLOW, async () => {
+    const runner = spawn(NODE, [join(dir, "handled.mjs"), `process.on("SIGTERM", () => {}); ${SLEEP}`], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exited = new Promise<number | null>((resolve) => runner.once("exit", (code) => resolve(code)));
+    const { waitFor } = watch(runner);
+    const { child } = await waitFor("child", "ready");
+    process.kill(runner.pid!, "SIGINT");
+    await sleep(100);
+    process.kill(runner.pid!, "SIGINT"); // mid-grace: must not skip the SIGKILL pass or exit early
+    expect(await exited).toBe(130);
+    expect(await gone(child)).toBe(true);
   });
 });
 

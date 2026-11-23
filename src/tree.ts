@@ -1,4 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
+import { timerMs } from "./timer.js";
 
 // Process-tree planning and signaling.
 //
@@ -18,13 +19,15 @@ import { execFile, execFileSync } from "node:child_process";
 //      the snapshot shows is inside the tree. A group shared with anything
 //      outside the tree gets its tree members signaled one pid at a time.
 //   3. A pid is never signaled unless the snapshot shows it in the tree, so a
-//      pid that was recycled after the snapshot cannot be hit by name. Never
-//      signaled in any case: a pid or group id of 1 or less, our own pid, our
-//      own group, or any ancestor of ours. A root that is us, leads or sits in
-//      our group, or has us or one of our ancestors beneath it is refused as a
-//      whole, and nothing is signaled. So is any plan from a snapshot that does
-//      not show our ancestors all the way up, since an ancestor the snapshot
-//      cannot see cannot be kept out of the plan.
+//      pid that was not in the snapshot cannot be hit by name. (A pid that IS
+//      in the plan and is recycled during the grace window can still take the
+//      SIGKILL.) A plan from a snapshot never signals a pid or group id of 1
+//      or less, our own pid, our own group, or any ancestor of ours. A root
+//      that is us, leads or sits in our group, or has us or one of our
+//      ancestors beneath it is refused as a whole, and nothing is signaled.
+//      So is any plan from a snapshot that does not show our ancestors all
+//      the way up, since an ancestor the snapshot cannot see cannot be kept
+//      out of the plan.
 //   4. When no usable snapshot exists (ps missing, slow, or garbage), the
 //      caller falls back to a group-only plan. Nothing here throws.
 //
@@ -106,13 +109,6 @@ export const DEFAULT_SNAPSHOT_TIMEOUT_MS = 2000;
 const PS_ARGS = ["-Ao", "pid=,ppid=,pgid=,comm="];
 const PS_MAX_BUFFER = 16 * 1024 * 1024;
 const PS_ROW = /^\s*(\d+)\s+(\d+)\s+(\d+)(?:\s+(.*?))?\s*$/;
-const MAX_TIMER_MS = 2 ** 31 - 1;
-
-/** Whole milliseconds node accepts, or null for a timeout that means "skip". */
-function normalizeTimeout(timeoutMs: number): number | null {
-  if (!(timeoutMs > 0)) return null;
-  return Math.min(Math.ceil(timeoutMs), MAX_TIMER_MS);
-}
 
 /**
  * Pure. Parses the output of `ps -Ao pid=,ppid=,pgid=,comm=`. A row is three
@@ -140,12 +136,13 @@ export function parseProcTable(raw: string): ProcRow[] {
 export function snapshotProcessTable(
   timeoutMs: number = DEFAULT_SNAPSHOT_TIMEOUT_MS,
 ): ProcRow[] | null {
-  const ms = normalizeTimeout(timeoutMs);
+  const ms = timerMs(timeoutMs);
   if (ms === null) return null;
   try {
     const out = execFileSync("ps", PS_ARGS, {
       encoding: "utf-8",
       timeout: ms,
+      killSignal: "SIGKILL",
       maxBuffer: PS_MAX_BUFFER,
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -165,7 +162,7 @@ export function snapshotProcessTable(
 export function snapshotProcessTableAsync(
   timeoutMs: number = DEFAULT_SNAPSHOT_TIMEOUT_MS,
 ): Promise<ProcRow[] | null> {
-  const ms = normalizeTimeout(timeoutMs);
+  const ms = timerMs(timeoutMs);
   if (ms === null) return Promise.resolve(null);
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), ms);
@@ -173,7 +170,7 @@ export function snapshotProcessTableAsync(
       execFile(
         "ps",
         PS_ARGS,
-        { encoding: "utf-8", timeout: ms, maxBuffer: PS_MAX_BUFFER },
+        { encoding: "utf-8", timeout: ms, killSignal: "SIGKILL", maxBuffer: PS_MAX_BUFFER },
         (err, stdout) => {
           clearTimeout(timer);
           const rows = err ? [] : parseProcTable(stdout);
@@ -229,13 +226,9 @@ export function planTreeKill(
   selfPid: number,
   opts: { rootLedGroup?: boolean } = {},
 ): TreeKillPlan | null {
-  const refuse = (refusal: TreeKillRefusal, refused: string): TreeKillPlan => ({
-    rootPid,
-    groups: [],
-    pids: [],
-    refused,
-    refusal,
-  });
+  const rootLedGroup = (opts ?? {}).rootLedGroup === true; // plain JavaScript may pass null
+  const refuse = (refusal: TreeKillRefusal, refused: string): TreeKillPlan =>
+    refusedPlan(rootPid, refusal, refused);
   if (!Number.isInteger(rootPid) || rootPid <= 1) {
     return refuse("invalid-root", `pid ${rootPid} is never signaled`);
   }
@@ -243,7 +236,7 @@ export function planTreeKill(
   const self = rows.get(selfPid);
   const root = rows.get(rootPid);
   if (!self) return null;
-  if (!root && !(opts.rootLedGroup && table.some((r) => r.pgid === rootPid))) return null;
+  if (!root && !(rootLedGroup && table.some((r) => r.pgid === rootPid))) return null;
   if (rootPid === selfPid) return refuse("self", "the root is this process");
   if (rootPid === self.pgid) return refuse("leads-our-group", "the root leads this process's group");
   if (root && root.pgid === self.pgid) return refuse("in-our-group", "the root is in this process's group");
@@ -324,27 +317,32 @@ export function planTreeKill(
 /**
  * The fallback plan: signal the root's group and nothing else. Use it when no
  * usable snapshot exists. A pid of 1 or less (or a non-integer), `selfPid`,
- * and our parent are refused. The parent is known without a table only when
- * `selfPid` is left at its default (this process), or when `parentPid` is
- * given. Deeper ancestors cannot be checked without a table, so callers must
- * spawn the root detached (as its own group leader).
+ * `parentPid` and the real `process.pid` and `process.ppid` are refused.
+ * `selfPid` defaults to this process, and `parentPid` to its parent when
+ * `selfPid` is left at its default. Without a table nothing else can be
+ * checked: not our own group when we do not lead it, and not a grandparent or
+ * a deeper ancestor. So callers must spawn the root detached (as its own group
+ * leader) and pass only that pid.
  */
 export function groupOnlyPlan(
   pid: number,
   selfPid: number = process.pid,
   parentPid: number | undefined = selfPid === process.pid ? process.ppid : undefined,
 ): TreeKillPlan {
-  const refuse = (refusal: TreeKillRefusal, refused: string): TreeKillPlan => ({
-    rootPid: pid,
-    groups: [],
-    pids: [],
-    refused,
-    refusal,
-  });
-  if (!Number.isInteger(pid) || pid <= 1) return refuse("invalid-root", `pid ${pid} is never signaled`);
-  if (pid === selfPid) return refuse("self", "the root is this process");
-  if (pid === parentPid) return refuse("parent", "the root is the parent of this process");
+  if (!Number.isInteger(pid) || pid <= 1) return refusedPlan(pid, "invalid-root", `pid ${pid} is never signaled`);
+  // The real process.pid and process.ppid are always refused, whatever selfPid
+  // and parentPid say: no caller means to signal them, and plain JavaScript
+  // like `pids.map(groupOnlyPlan)` passes (index, array) in their place.
+  if (pid === selfPid || pid === process.pid) return refusedPlan(pid, "self", "the root is this process");
+  if (pid === parentPid || pid === process.ppid) {
+    return refusedPlan(pid, "parent", "the root is the parent of this process");
+  }
   return { rootPid: pid, groups: [], pids: [] };
+}
+
+/** A plan that signals nothing, with the typed reason and its text kept in step. */
+export function refusedPlan(rootPid: number, refusal: TreeKillRefusal, refused: string): TreeKillPlan {
+  return { rootPid, groups: [], pids: [], refused, refusal };
 }
 
 const defaultKill: KillFn = (pid, signal) => {

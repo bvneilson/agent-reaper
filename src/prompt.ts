@@ -16,8 +16,9 @@ import { join } from "node:path";
  *
  * The file is written with mode 0600 inside a fresh 0700 directory under `dir`
  * (the OS temp directory by default), and both are removed before this
- * returns. Nothing stays on disk, and the prompt never appears in argv, where
- * other users of the machine can read it.
+ * returns. No file is left behind: the data lives in an unlinked temp file
+ * until the child closes its stdin, and the prompt never appears in argv,
+ * where other users of the machine can read it.
  */
 export function openPromptStdin(prompt: string, dir: string = tmpdir()): number {
   const holder = mkdtempSync(join(dir, "prompt-"));

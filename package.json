@@ -1,6 +1,6 @@
 {
   "name": "agent-reaper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Supervise headless agent processes: timeouts that kill the whole process tree, not just the parent.",
   "license": "MIT",
   "author": "Brennan Neilson",

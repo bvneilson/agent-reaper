@@ -146,3 +146,68 @@ describe("killTree with a snapshot that lacks the root's row", () => {
     }
   });
 });
+
+describe("killTree with a root that can never be signaled", () => {
+  const calls: Array<[number, unknown]> = [];
+  const run = async (root: number, table: ProcRow[] | null) => {
+    calls.length = 0;
+    vi.mocked(snapshotProcessTableAsync).mockResolvedValueOnce(table);
+    const spy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      calls.push([pid, signal]);
+      return true;
+    });
+    try {
+      return await killTree(root, { graceMs: 0 });
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  test("0, a negative pid, 1 and a non-integer are denied, not gone, with or without a snapshot", async () => {
+    for (const root of [0, -5, 1, 1.5, Number.NaN]) {
+      for (const table of [BASE, null]) {
+        expect(await run(root, table)).toBe("denied");
+        expect(calls).toEqual([]);
+      }
+    }
+  });
+});
+
+describe("killTree when some targets answer EPERM", () => {
+  const ROOT = 5_001_000;
+  // The root's group, a child in a group of its own, and a grandchild in another one.
+  const table = [
+    ...BASE,
+    row(ROOT, SELF, ROOT),
+    row(5_001_100, ROOT, 5_001_100),
+    row(5_001_200, ROOT, 5_001_200),
+  ];
+  const run = async (denied: (pid: number) => boolean) => {
+    const calls: Array<[number, unknown]> = [];
+    vi.mocked(snapshotProcessTableAsync).mockResolvedValueOnce(table);
+    const spy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      calls.push([pid, signal]);
+      if (denied(pid)) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      return true;
+    });
+    try {
+      return { outcome: await killTree(ROOT, { graceMs: 0 }), calls };
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  test("a non-root target: denied is reported, and the other targets are still signaled", async () => {
+    const { outcome, calls } = await run((pid) => pid === -5_001_100);
+    expect(outcome).toBe("denied");
+    const term = calls.filter(([, s]) => s === "SIGTERM").map(([pid]) => pid);
+    expect(term).toEqual([-ROOT, -5_001_100, -5_001_200]);
+    expect(calls.filter(([, s]) => s === "SIGKILL").map(([pid]) => pid)).toContain(-5_001_200);
+  });
+
+  test("the root's own group: denied, and nothing else is signaled", async () => {
+    const { outcome, calls } = await run((pid) => pid === -ROOT);
+    expect(outcome).toBe("denied");
+    expect(calls).toEqual([[-ROOT, "SIGTERM"]]);
+  });
+});

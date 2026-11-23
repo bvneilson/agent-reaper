@@ -45,15 +45,87 @@ describe("the timeout is normalized before it reaches node", () => {
   });
 
   test("an oversized timeout is clamped to the largest timer value, sync and async", async () => {
-    spawned.sync.mockReturnValue("  7  1  7 node\n");
-    snapshotProcessTable(2 ** 40);
-    expect(spawned.sync.mock.calls[0][2].timeout).toBe(2 ** 31 - 1);
-    let pending = true;
-    void snapshotProcessTableAsync(2 ** 40).then(() => {
-      pending = false;
+    vi.useFakeTimers();
+    try {
+      spawned.sync.mockReturnValue("  7  1  7 node\n");
+      snapshotProcessTable(2 ** 40);
+      expect(spawned.sync.mock.calls[0][2].timeout).toBe(2 ** 31 - 1);
+      let pending = true;
+      void snapshotProcessTableAsync(2 ** 40).then(() => {
+        pending = false;
+      });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(spawned.async.mock.calls[0][2].timeout).toBe(2 ** 31 - 1);
+      expect(pending).toBe(true); // the timer did not fire after 20 ms
+      vi.clearAllTimers(); // nothing is left pending in the worker
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("a ps that fails, hangs or prints garbage gives null, never a throw", () => {
+  beforeEach(() => {
+    spawned.sync.mockReset();
+    spawned.async.mockReset();
+  });
+
+  test("sync: ps throwing (missing, non-zero exit, timeout) gives null", () => {
+    spawned.sync.mockImplementation(() => {
+      throw Object.assign(new Error("spawnSync ps ENOENT"), { code: "ENOENT" });
     });
-    await new Promise((r) => setTimeout(r, 20));
-    expect(spawned.async.mock.calls[0][2].timeout).toBe(2 ** 31 - 1);
-    expect(pending).toBe(true); // the timer did not fire after 1 ms
+    expect(snapshotProcessTable(50)).toBeNull();
+  });
+
+  test("sync: output with no parsable row (garbage, a header only, nothing) gives null", () => {
+    for (const out of ["", "\n\n", "PID PPID PGID COMM\n", "not a table\nat all\n"]) {
+      spawned.sync.mockReturnValue(out);
+      expect(snapshotProcessTable(50)).toBeNull();
+    }
+  });
+
+  test("async: an error from ps, with or without output, gives null", async () => {
+    spawned.async.mockImplementation((_cmd, _args, _opts, cb) => cb(new Error("ps failed"), "  7  1  7 node\n"));
+    expect(await snapshotProcessTableAsync(50)).toBeNull();
+  });
+
+  test("async: output with no parsable row gives null", async () => {
+    for (const out of ["", "PID PPID PGID COMM\n", "not a table\n"]) {
+      spawned.async.mockImplementation((_cmd, _args, _opts, cb) => cb(null, out));
+      expect(await snapshotProcessTableAsync(50)).toBeNull();
+    }
+  });
+
+  test("async: execFile throwing synchronously gives null", async () => {
+    spawned.async.mockImplementation(() => {
+      throw new Error("spawn failed");
+    });
+    expect(await snapshotProcessTableAsync(50)).toBeNull();
+  });
+
+  test("async: a ps that never answers is given up on at the timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      spawned.async.mockImplementation(() => undefined); // the callback is never called
+      let result: unknown = "pending";
+      void snapshotProcessTableAsync(30).then((rows) => {
+        result = rows;
+      });
+      await vi.advanceTimersByTimeAsync(29);
+      expect(result).toBe("pending");
+      await vi.advanceTimersByTimeAsync(2);
+      expect(result).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("both reads make node SIGKILL a ps that outlives the timeout, not just SIGTERM it", async () => {
+    spawned.sync.mockReturnValue("  7  1  7 node\n");
+    spawned.async.mockImplementation((_cmd, _args, _opts, cb) => cb(null, "  7  1  7 node\n"));
+    snapshotProcessTable(50);
+    await snapshotProcessTableAsync(50);
+    expect(spawned.sync.mock.calls[0][2].killSignal).toBe("SIGKILL");
+    expect(spawned.async.mock.calls[0][2].killSignal).toBe("SIGKILL");
   });
 });
