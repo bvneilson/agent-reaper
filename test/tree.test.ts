@@ -326,6 +326,19 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
   });
 });
 
+describe("planTreeKill called from plain JavaScript", () => {
+  test("null or missing opts are the same as {}", () => {
+    const want = planTreeKill(1000, TREE, SELF, {});
+    expect(want).not.toBeNull();
+    // @ts-expect-error opts may not be null in TypeScript
+    expect(planTreeKill(1000, TREE, SELF, null)).toEqual(want);
+    expect(planTreeKill(1000, TREE, SELF, undefined)).toEqual(want);
+    // The option is only read when the root's row is absent.
+    // @ts-expect-error opts may not be null in TypeScript
+    expect(planTreeKill(9999, TREE, SELF, null)).toBeNull();
+  });
+});
+
 describe("groupOnlyPlan", () => {
   test("signals the root's group alone", () => {
     expect(groupOnlyPlan(1234)).toEqual({ rootPid: 1234, groups: [], pids: [] });
@@ -343,6 +356,21 @@ describe("groupOnlyPlan", () => {
   test("an explicit selfPid is refused, and an unrelated pid is not", () => {
     expect(groupOnlyPlan(777, 777).refused).toMatch(/this process/);
     expect(groupOnlyPlan(777, 888)).toEqual({ rootPid: 777, groups: [], pids: [] });
+  });
+  test("always refuses the real process.pid and process.ppid, whatever selfPid and parentPid say", () => {
+    // arr.map(groupOnlyPlan) from plain JavaScript passes (index, array) as (selfPid, parentPid).
+    for (const pid of [process.pid, process.ppid]) {
+      for (const plan of [groupOnlyPlan(pid, 0, 0), groupOnlyPlan(pid, 777, 888), [pid].map(groupOnlyPlan as never)[0]]) {
+        expect(plan).toMatchObject({ groups: [], pids: [] });
+        expect((plan as TreeKillPlan).refused).toBeTruthy();
+      }
+    }
+    expect(groupOnlyPlan(process.pid, 777, 888).refusal).toBe("self");
+    expect(groupOnlyPlan(process.ppid, 777, 888).refusal).toBe("parent");
+  });
+  test("cannot refuse a deeper ancestor or our own group: that needs a snapshot", () => {
+    // Documented limit: only this process and its parent can be checked without a table.
+    expect(groupOnlyPlan(4_000_000, 777, 888)).toEqual({ rootPid: 4_000_000, groups: [], pids: [] });
   });
   test("refuses pid 1 and below", () => {
     for (const pid of [1, 0, -5, Number.NaN]) {
@@ -519,9 +547,10 @@ describe("signalTree", () => {
     expect(os.calls).toEqual([]);
   });
 
-  test("pid reuse: a pid absent from the snapshot is never signaled", () => {
-    // 4000 sat in the tree's neighborhood after the snapshot (a recycled pid). It is
-    // not in the table, so it is not in the plan and no signal names it.
+  test("a pid absent from the snapshot is never signaled", () => {
+    // 4000 appeared after the snapshot (it could be a recycled pid). It is not in
+    // the table, so it is not in the plan and no signal names it. A pid that IS in
+    // the plan and is recycled during the grace window can still get the SIGKILL.
     const p = planTreeKill(1000, TREE, SELF)!;
     expect(p.pids).not.toContain(4000);
     const os = fakeOs([...TREE, row(4000, 1, 4000)]);

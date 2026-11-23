@@ -3,12 +3,14 @@ import { closeSync } from "node:fs";
 import { constants } from "node:os";
 import { withoutEnv } from "./env.js";
 import { openPromptStdin } from "./prompt.js";
+import { DEFAULT_GRACE_MS, graceOf, timeoutOf } from "./timer.js";
 import {
   DEFAULT_SNAPSHOT_TIMEOUT_MS,
   groupOnlyPlan,
   killTreeSurvivors,
   planTreeKill,
   type ProcRow,
+  refusedPlan,
   signalTree,
   snapshotProcessTableAsync,
   type TreeKillPlan,
@@ -41,10 +43,7 @@ import {
 // outlived its parent before any kill cannot be traced back to the child, and
 // is not reached.
 
-/** Default wait, in ms, between the first signal and the SIGKILL of survivors. */
-export const DEFAULT_GRACE_MS = 5000;
-
-const MAX_TIMER_MS = 2 ** 31 - 1;
+export { DEFAULT_GRACE_MS };
 
 /** Options for {@link spawnSupervised}. */
 export interface SupervisedOptions {
@@ -59,7 +58,11 @@ export interface SupervisedOptions {
    * {@link openPromptStdin}). Without it, stdin is the null device.
    */
   prompt?: string;
-  /** Kill the tree this many ms after the spawn. Unset, 0 or less: no timeout. */
+  /**
+   * Kill the tree this many ms after the spawn. Unset, 0 or less, NaN and
+   * Infinity: no timeout. A finite value above 2147483647 (about 24.8 days) is
+   * clamped to it.
+   */
   timeoutMs?: number;
   /**
    * Ms between the first signal and the SIGKILL of survivors. Default 5000.
@@ -69,8 +72,8 @@ export interface SupervisedOptions {
   /**
    * Bound, in ms, on each `ps` read a kill plans from (one, or two when the
    * child exits while the first runs). Default 2000. 0 or less skips the
-   * snapshot, and only the child's own process group is
-   * signaled (a descendant in a group or session of its own is not reached).
+   * snapshot, and only the child's own process group is signaled (a
+   * descendant in a group or session of its own is not reached).
    */
   snapshotTimeoutMs?: number;
 }
@@ -144,7 +147,11 @@ export type KillTreeOutcome = "done" | "denied" | "gone";
  * arguments), and whatever `openPromptStdin` throws when `prompt` is set (it
  * writes a temporary file). A command that cannot be started rejects `done` instead.
  */
-export function spawnSupervised(command: string, args: string[], opts: SupervisedOptions = {}): Supervised {
+export function spawnSupervised(
+  command: string,
+  args: readonly string[],
+  opts: SupervisedOptions = {},
+): Supervised {
   const graceMs = graceOf(opts.graceMs);
   const snapshotTimeoutMs = opts.snapshotTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
   const env = withoutEnv(opts.env ?? process.env, opts.stripEnv ?? []);
@@ -178,7 +185,7 @@ export function spawnSupervised(command: string, args: string[], opts: Supervise
   // The timer and the exit can land in the same turn of the event loop. Both
   // go through reap(), so whichever runs first starts the one reap, and the
   // other joins it. timedOut is true only when the timer ran first.
-  const timeoutMs = timerMs(opts.timeoutMs);
+  const timeoutMs = timeoutOf(opts.timeoutMs);
   if (child.pid !== undefined && timeoutMs !== null) {
     timer = setTimeout(() => {
       timedOut = true;
@@ -207,20 +214,22 @@ export function spawnSupervised(command: string, args: string[], opts: Supervise
  * then SIGKILL to the survivors of the same plan. The root should lead its own
  * process group (spawned detached), since its group is signaled whole.
  *
- * A root that is this process, leads or sits in its group, has it beneath it
- * (which covers this process's parent), or is 1 or less is refused, and
- * nothing is signaled. The one exception: when a trusted snapshot shows
- * nothing of the root or its group, the result is `"gone"` before any of those
- * checks run, and nothing is signaled either. So is any root refused when
- * the snapshot does not show this process's ancestors back to pid 1. If the
- * snapshot no longer shows the root itself, the plan starts from the members
- * its process group still has (POSIX never reuses a pid while a group with
- * that id exists), under the same checks. So a group whose leader exited is
- * still refused when it holds this process or one of its ancestors. Only
- * without a usable snapshot (`snapshotTimeoutMs` 0 or less, `ps` failing or
- * timing out, or a table without this process's own row) is the root's group
- * signaled on its own, and then only this process and its parent can be
- * checked.
+ * A root of 1 or less, or one that is not an integer, is always refused
+ * (`"denied"`, never `"gone"`). So is a root that is this process, leads or
+ * sits in its group, or has it beneath it (which covers this process's
+ * parent), and so is any root when the snapshot does not show this process's
+ * ancestors back to pid 1. Nothing is signaled for a refused root. The one
+ * exception to those last checks: when a trusted snapshot shows nothing of the
+ * root or its group, the result is `"gone"` before they run, and nothing is
+ * signaled either. If the snapshot no longer shows the root itself, the plan
+ * starts from the members its process group still has (POSIX never reuses a
+ * pid while a group with that id exists), under the same checks. So a group
+ * whose leader exited is still refused when it holds this process or one of
+ * its ancestors. Only without a usable snapshot (`snapshotTimeoutMs` 0 or
+ * less, `ps` failing or timing out, or a table without this process's own
+ * row) is the root's group signaled on its own, and then only this process and
+ * its parent can be checked, so pass only the pid of a tree you started
+ * detached.
  *
  * Resolves to:
  * - `"done"`: at least one target took SIGTERM, the survivors got SIGKILL
@@ -315,13 +324,7 @@ export function planChildKill(pid: number, table: ProcRow[] | null, running: boo
     return plan;
   }
   if (table.some((r) => r.pid === pid)) {
-    return {
-      rootPid: pid,
-      groups: [],
-      pids: [],
-      refused: "the root's pid was reused after it exited",
-      refusal: "pid-reused",
-    };
+    return refusedPlan(pid, "pid-reused", "the root's pid was reused after it exited");
   }
   const plan = planTreeKill(pid, table, process.pid, { rootLedGroup: true });
   if (plan) return plan;
@@ -348,14 +351,4 @@ async function killPlan(
   if (first.signaled.length === 0) return { first, last: null };
   await new Promise((resolve) => setTimeout(resolve, graceMs));
   return { first, last: killTreeSurvivors(plan, first) };
-}
-
-/** A delay node's timers accept, or null when `ms` asks for none. */
-function timerMs(ms: number | undefined): number | null {
-  if (ms === undefined || !(ms > 0)) return null;
-  return Math.min(Math.ceil(ms), MAX_TIMER_MS);
-}
-
-function graceOf(ms: number | undefined): number {
-  return timerMs(ms ?? DEFAULT_GRACE_MS) ?? 0;
 }
