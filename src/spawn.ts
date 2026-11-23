@@ -25,12 +25,16 @@ import {
 //   4. Wait the grace period.
 //   5. SIGKILL whatever in the SAME plan is still alive.
 //
-// While the child runs, the plan starts from the child's own row. After it
-// exits, its pid is free and may already belong to someone else, so the plan
-// starts from the members its process group still has instead (POSIX never
-// reuses a pid while a group with that id exists). If the table still shows a
-// process with the child's pid, the pid was reused, and nothing is signaled.
-// With no snapshot, only the child's own group is signaled.
+// While the child runs, the plan starts from the child's own row. If that plan
+// is refused only because ps hides one of our ancestors, the child's own group
+// is signaled instead: the child has not been collected, so its pid, and the
+// group it leads, are still provably ours. After it exits, its pid is free and
+// may already belong to someone else, so the plan starts from the members its
+// process group still has instead (POSIX never reuses a pid while a group with
+// that id exists). If the table shows none, nothing is signaled. If the table
+// still shows a process with the child's pid, the pid was reused, and nothing
+// is signaled either. With no usable snapshot, only the child's own group is
+// signaled.
 //
 // A normal exit reaps too: a background process left in the child's group, and
 // everything under it, is killed. A descendant that left the child's group and
@@ -81,7 +85,8 @@ export interface SupervisedResult {
   /**
    * How many kill(2) targets took the first signal of the reap. A target is a
    * whole process group or a single process. 0 when nothing was left to
-   * signal (a normal exit with no leftovers) or when the plan was refused.
+   * signal (a normal exit with no leftovers, in which case nothing at all is
+   * sent) or when the plan was refused.
    */
   reaped: number;
 }
@@ -129,10 +134,10 @@ export type KillTreeOutcome = "done" | "denied" | "gone";
  * out (`timeoutMs`), when it exits, or when `kill()` is called. See
  * {@link SupervisedOptions} for the environment, stdin and timing options.
  *
- * Timers are unref'd, so supervision never keeps the event loop alive on its
- * own. If nothing else does (a short script whose child has already exited,
- * say), the process can exit during the grace period, before survivors get
- * their SIGKILL.
+ * The timeout timer is unref'd: while the child runs, the child itself keeps
+ * the event loop alive. Once a kill has started, its grace timer holds the
+ * event loop open (for at most `graceMs`), so a process that awaits `done`
+ * does not exit before the survivors get their SIGKILL.
  *
  * Throws whatever `child_process.spawn` throws synchronously (invalid
  * arguments). A command that cannot be started rejects `done` instead.
@@ -168,6 +173,9 @@ export function spawnSupervised(command: string, args: string[], opts: Supervise
   // rejection for a failed spawn. A caller that awaits it still sees the error.
   done.catch(() => {});
 
+  // The timer and the exit can land in the same turn of the event loop. Both
+  // go through reap(), so whichever runs first starts the one reap, and the
+  // other joins it. timedOut is true only when the timer ran first.
   const timeoutMs = timerMs(opts.timeoutMs);
   if (child.pid !== undefined && timeoutMs !== null) {
     timer = setTimeout(() => {
@@ -259,6 +267,7 @@ async function reapChild(
   // child (freeing its pid for reuse) only on the event loop, so a child seen
   // running now is still ours when killPlan sends that signal.
   const plan = planChildKill(pid, table, running());
+  if (!plan) return 0;
   const { first } = await killPlan(plan, signal, graceMs);
   return first.signaled.length;
 }
@@ -266,20 +275,42 @@ async function reapChild(
 /**
  * Pure. Step 2 for a child this process spawned detached: which plan to kill
  * it by, from a snapshot taken while it was `running` or after it exited (or
- * from no snapshot at all). Exported for tests. The package does not export it.
+ * from no snapshot at all). Null when there is nothing to signal. Exported for
+ * tests. The package does not export it.
  */
-export function planChildKill(pid: number, table: ProcRow[] | null, running: boolean): TreeKillPlan {
+export function planChildKill(pid: number, table: ProcRow[] | null, running: boolean): TreeKillPlan | null {
   if (!table) return groupOnlyPlan(pid);
-  if (running) return planTreeKill(pid, table, process.pid) ?? groupOnlyPlan(pid);
-  if (table.some((r) => r.pid === pid)) {
-    return { rootPid: pid, groups: [], pids: [], refused: "the root's pid was reused after it exited" };
+  if (running) {
+    const plan = planTreeKill(pid, table, process.pid);
+    // A child not yet collected still owns its pid, and the group it leads is
+    // one we created. So when the only problem is ancestors ps did not show
+    // (a ps that hides other users' processes, say), that group is still safe
+    // to signal. Every other refusal stands.
+    if (!plan || plan.refusal === "unknown-ancestry") return groupOnlyPlan(pid);
+    return plan;
   }
-  return planTreeKill(pid, table, process.pid, { rootLedGroup: true }) ?? groupOnlyPlan(pid);
+  if (table.some((r) => r.pid === pid)) {
+    return {
+      rootPid: pid,
+      groups: [],
+      pids: [],
+      refused: "the root's pid was reused after it exited",
+      refusal: "pid-reused",
+    };
+  }
+  const plan = planTreeKill(pid, table, process.pid, { rootLedGroup: true });
+  if (plan) return plan;
+  // Null here means one of two things. The table lacks our own row: it is not
+  // trusted, so this is the no-snapshot case and only the child's group is
+  // signaled. Or nothing of the child's group is left: there is nothing to
+  // signal, and its group id, free by now, must not be signaled at all.
+  return table.some((r) => r.pid === process.pid) ? null : groupOnlyPlan(pid);
 }
 
 /**
  * Steps 3 to 5: the first signal, the grace, then SIGKILL to the survivors of
  * the same plan. The first signal goes out before this function first yields.
+ * The grace timer is NOT unref'd: finishing the reap keeps the process alive.
  */
 async function killPlan(
   plan: TreeKillPlan,
@@ -290,7 +321,7 @@ async function killPlan(
   // Nothing took the signal, so there is nothing to wait for. A SIGKILL pass
   // now could only find a group or pid that was reused since.
   if (first.signaled.length === 0) return { first, last: null };
-  await sleep(graceMs);
+  await new Promise((resolve) => setTimeout(resolve, graceMs));
   return { first, last: killTreeSurvivors(plan, undefined, first) };
 }
 
@@ -302,8 +333,4 @@ function timerMs(ms: number | undefined): number | null {
 
 function graceOf(ms: number | undefined): number {
   return timerMs(ms ?? DEFAULT_GRACE_MS) ?? 0;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms).unref());
 }

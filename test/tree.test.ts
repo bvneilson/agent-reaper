@@ -11,6 +11,7 @@ import {
   type KillFn,
   type ProcRow,
   type TreeKillPlan,
+  type TreeKillRefusal,
 } from "../src/index.js";
 
 const SELF = 500;
@@ -33,6 +34,7 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
     groups?: number[];
     pids?: number[];
     refused?: RegExp;
+    refusal?: TreeKillRefusal;
   }> = [
     {
       name: "a shell in its own group, with a build under it",
@@ -89,30 +91,35 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
       root: 1000,
       table: [...BASE, row(1000, SELF, SELF), row(2000, 1000, 2000)],
       refused: /this process's group/,
+      refusal: "in-our-group",
     },
     {
       name: "a root that leads our own group is refused",
       root: 400,
       table: [row(1, 0, 1), row(400, 1, 400), row(SELF, 400, 400)],
       refused: /this process's group/,
+      refusal: "leads-our-group",
     },
     {
       name: "ourselves as the root is refused",
       root: SELF,
       table: BASE,
       refused: /this process/,
+      refusal: "self",
     },
     {
       name: "a root we run under is refused",
       root: 400,
       table: [row(1, 0, 1), row(400, 1, 400), row(SELF, 400, SELF)],
       refused: /inside the tree/,
+      refusal: "self-in-tree",
     },
     {
       name: "pid 1 is refused",
       root: 1,
       table: BASE,
       refused: /never signaled/,
+      refusal: "invalid-root",
     },
     {
       name: "a descendant in our group or in group 1 is signaled by pid, never by group",
@@ -136,11 +143,13 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
       expect(plan).not.toBeNull();
       if (c.refused) {
         expect(plan!.refused).toMatch(c.refused);
+        expect(plan!.refusal).toBe(c.refusal);
         expect(plan!.groups).toEqual([]);
         expect(plan!.pids).toEqual([]);
         return;
       }
       expect(plan!.refused).toBeUndefined();
+      expect(plan!.refusal).toBeUndefined();
       expect(plan!.rootPid).toBe(c.root);
       expect(plan!.groups).toEqual(c.groups!);
       expect(plan!.pids).toEqual(c.pids!);
@@ -196,6 +205,7 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
     ];
     const plan = planTreeKill(1000, table, SELF)!;
     expect(plan.refused).toBe("the snapshot does not show this process's ancestors back to pid 1");
+    expect(plan.refusal).toBe("unknown-ancestry");
     expect(plan.groups).toEqual([]);
     expect(plan.pids).toEqual([]);
   });
@@ -212,6 +222,7 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
     ];
     const plan = planTreeKill(1000, table, SELF)!;
     expect(plan.refused).toBe("the snapshot does not show this process's ancestors back to pid 1");
+    expect(plan.refusal).toBe("unknown-ancestry");
     const os = fakeOs([...table, row(400, 300, 400)]);
     expect(signalTree(plan, "SIGTERM", os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
     expect(os.calls).toEqual([]);
@@ -225,9 +236,18 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
       row(300, 400, 300),
       row(1000, SELF, 1000),
     ];
-    expect(planTreeKill(1000, table, SELF)!.refused).toBe(
-      "the snapshot does not show this process's ancestors back to pid 1",
-    );
+    const plan = planTreeKill(1000, table, SELF)!;
+    expect(plan.refused).toBe("the snapshot does not show this process's ancestors back to pid 1");
+    expect(plan.refusal).toBe("unknown-ancestry");
+  });
+
+  test("unknown ancestry is reported only when every other check passes", () => {
+    // The root 400 is our parent, and its own parent's row is missing. We are inside its tree,
+    // and that is the reason given, so "unknown-ancestry" always means it is the only problem.
+    const table = [row(1, 0, 1), row(400, 350, 400), row(SELF, 400, SELF)];
+    const plan = planTreeKill(400, table, SELF)!;
+    expect(plan.refusal).toBe("self-in-tree");
+    expect(plan.refused).toBe("this process is inside the tree");
   });
 
   test("an ancestor printed with an empty comm is parsed, and its group is not signaled whole", () => {
@@ -287,8 +307,8 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
   test("rootLedGroup keeps every refusal: we run under a surviving member, pid 1, our own pid", () => {
     expect(planTreeKill(1000, [row(1, 0, 1), row(1001, 1, 1000), row(SELF, 1001, SELF)], SELF, { rootLedGroup: true })!.refused)
       .toBe("this process is inside the tree");
-    expect(planTreeKill(1, BASE, SELF, { rootLedGroup: true })!.refused).toMatch(/never signaled/);
-    expect(planTreeKill(SELF, BASE, SELF, { rootLedGroup: true })!.refused).toMatch(/this process/);
+    expect(planTreeKill(1, BASE, SELF, { rootLedGroup: true })!.refusal).toBe("invalid-root");
+    expect(planTreeKill(SELF, BASE, SELF, { rootLedGroup: true })!.refusal).toBe("self");
   });
 
   test("a root whose group holds one of our ancestors is refused", () => {
@@ -300,6 +320,7 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
     ];
     const plan = planTreeKill(1000, table, SELF)!;
     expect(plan.refused).toBe("this process is inside the tree"); // we are below that ancestor, so the self check fires
+    expect(plan.refusal).toBe("self-in-tree");
     expect(plan.groups).toEqual([]);
     expect(plan.pids).toEqual([]);
   });
@@ -311,7 +332,9 @@ describe("groupOnlyPlan", () => {
   });
   test("refuses our own pid and, by default, our parent's", () => {
     expect(groupOnlyPlan(process.pid).refused).toMatch(/this process/);
+    expect(groupOnlyPlan(process.pid).refusal).toBe("self");
     expect(groupOnlyPlan(process.ppid).refused).toMatch(/parent/);
+    expect(groupOnlyPlan(process.ppid).refusal).toBe("parent");
     const os = fakeOs(TREE);
     expect(signalTree(groupOnlyPlan(process.pid), "SIGTERM", os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
     expect(signalTree(groupOnlyPlan(process.ppid), "SIGTERM", os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
@@ -324,6 +347,7 @@ describe("groupOnlyPlan", () => {
   test("refuses pid 1 and below", () => {
     for (const pid of [1, 0, -5, Number.NaN]) {
       expect(groupOnlyPlan(pid).refused).toMatch(/never signaled/);
+      expect(groupOnlyPlan(pid).refusal).toBe("invalid-root");
     }
   });
 });

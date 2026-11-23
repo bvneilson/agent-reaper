@@ -52,12 +52,37 @@ export interface TreeKillPlan {
   /** Tree members signaled one by one (their group also holds outsiders). */
   pids: number[];
   /**
-   * Set when signaling would hit us or is otherwise unsafe. A refused plan has
-   * empty `groups` and `pids`, and {@link signalTree} signals nothing for it.
-   * Callers must not fall back to a group kill for a refused plan.
+   * Set when signaling would hit us or is otherwise unsafe: why, in words. A
+   * refused plan has empty `groups` and `pids`, and {@link signalTree} signals
+   * nothing for it. Callers must not fall back to a group kill for a refused
+   * plan.
    */
   refused?: string;
+  /** Why the plan was refused, as a code to branch on. Set whenever `refused` is. */
+  refusal?: TreeKillRefusal;
 }
+
+/**
+ * Why a plan was refused.
+ * - `invalid-root`: the root pid is 1 or less, or not an integer.
+ * - `self`: the root is this process.
+ * - `parent`: the root is this process's parent ({@link groupOnlyPlan}).
+ * - `leads-our-group` / `in-our-group`: the root leads, or sits in, this
+ *   process's group.
+ * - `self-in-tree`: this process (and so the ancestors above it) is inside the tree.
+ * - `unknown-ancestry`: the snapshot does not show this process's ancestors
+ *   back to pid 1. Reported only when no other reason applies.
+ * - `pid-reused`: the root exited, and its pid now names another process.
+ */
+export type TreeKillRefusal =
+  | "invalid-root"
+  | "self"
+  | "parent"
+  | "leads-our-group"
+  | "in-our-group"
+  | "self-in-tree"
+  | "unknown-ancestry"
+  | "pid-reused";
 
 /** The signature of `process.kill`, injectable for tests. */
 export type KillFn = (pid: number, signal: NodeJS.Signals | number) => void;
@@ -178,8 +203,9 @@ const UNKNOWN_ANCESTRY = "the snapshot does not show this process's ancestors ba
  *   group). Also when the snapshot does not show our ancestors back to pid 1
  *   (or to a parent pid of 0): a row missing on the way up, or a ppid cycle,
  *   leaves every ancestor above that point unknown, and an unknown ancestor
- *   could be planned as part of the tree. {@link signalTree} signals nothing
- *   for a refused plan.
+ *   could be planned as part of the tree. That refusal (`unknown-ancestry`) is
+ *   checked last, so it is reported only when every other check passed.
+ *   {@link signalTree} signals nothing for a refused plan.
  * - otherwise a plan. Every ancestor of ours is then known, and the plan never
  *   contains `selfPid`, our ancestors, our group, or any pid or group id of 1
  *   or less. A group is signaled whole only when every member the snapshot
@@ -203,29 +229,43 @@ export function planTreeKill(
   selfPid: number,
   opts: { rootLedGroup?: boolean } = {},
 ): TreeKillPlan | null {
-  const refuse = (why: string): TreeKillPlan => ({ rootPid, groups: [], pids: [], refused: why });
+  const refuse = (refusal: TreeKillRefusal, refused: string): TreeKillPlan => ({
+    rootPid,
+    groups: [],
+    pids: [],
+    refused,
+    refusal,
+  });
   if (!Number.isInteger(rootPid) || rootPid <= 1) {
-    return refuse(`pid ${rootPid} is never signaled`);
+    return refuse("invalid-root", `pid ${rootPid} is never signaled`);
   }
   const rows = new Map(table.map((r) => [r.pid, r]));
   const self = rows.get(selfPid);
   const root = rows.get(rootPid);
   if (!self) return null;
   if (!root && !(opts.rootLedGroup && table.some((r) => r.pgid === rootPid))) return null;
-  if (rootPid === selfPid) return refuse("the root is this process");
-  if (rootPid === self.pgid) return refuse("the root leads this process's group");
-  if (root && root.pgid === self.pgid) return refuse("the root is in this process's group");
+  if (rootPid === selfPid) return refuse("self", "the root is this process");
+  if (rootPid === self.pgid) return refuse("leads-our-group", "the root leads this process's group");
+  if (root && root.pgid === self.pgid) return refuse("in-our-group", "the root is in this process's group");
 
   // Our ancestors, from the snapshot, up to pid 1 (or a parent pid of 0, the
   // top of what this process can see). A missing row or a racy ppid cycle on
-  // the way up leaves the rest of our ancestry unknown: refuse, fail closed.
+  // the way up leaves the rest of our ancestry unknown, and the plan is
+  // refused (fail closed) once the other checks below have passed.
   const ancestors = new Set<number>();
+  let ancestryKnown = true;
   for (let p = self.ppid; p > 0; ) {
-    if (ancestors.has(p)) return refuse(UNKNOWN_ANCESTRY);
+    if (ancestors.has(p)) {
+      ancestryKnown = false;
+      break;
+    }
     ancestors.add(p);
     if (p === 1) break;
     const up = rows.get(p);
-    if (!up) return refuse(UNKNOWN_ANCESTRY);
+    if (!up) {
+      ancestryKnown = false;
+      break;
+    }
     p = up.ppid;
   }
 
@@ -253,7 +293,9 @@ export function planTreeKill(
   // Any ancestor of ours in the tree has us in it too (both walks follow ppid),
   // so this one check covers ancestors as well. Ancestors are still excluded by
   // pid and by group below, as defense in depth.
-  if (tree.has(selfPid)) return refuse("this process is inside the tree");
+  if (tree.has(selfPid)) return refuse("self-in-tree", "this process is inside the tree");
+  // Last, so that this reason always means it is the only problem.
+  if (!ancestryKnown) return refuse("unknown-ancestry", UNKNOWN_ANCESTRY);
 
   const byGroup = new Map<number, number[]>();
   for (const pid of tree) {
@@ -292,10 +334,16 @@ export function groupOnlyPlan(
   selfPid: number = process.pid,
   parentPid: number | undefined = selfPid === process.pid ? process.ppid : undefined,
 ): TreeKillPlan {
-  const refuse = (why: string): TreeKillPlan => ({ rootPid: pid, groups: [], pids: [], refused: why });
-  if (!Number.isInteger(pid) || pid <= 1) return refuse(`pid ${pid} is never signaled`);
-  if (pid === selfPid) return refuse("the root is this process");
-  if (pid === parentPid) return refuse("the root is the parent of this process");
+  const refuse = (refusal: TreeKillRefusal, refused: string): TreeKillPlan => ({
+    rootPid: pid,
+    groups: [],
+    pids: [],
+    refused,
+    refusal,
+  });
+  if (!Number.isInteger(pid) || pid <= 1) return refuse("invalid-root", `pid ${pid} is never signaled`);
+  if (pid === selfPid) return refuse("self", "the root is this process");
+  if (pid === parentPid) return refuse("parent", "the root is the parent of this process");
   return { rootPid: pid, groups: [], pids: [] };
 }
 
@@ -305,7 +353,7 @@ const defaultKill: KillFn = (pid, signal) => {
 
 /** Each target as the kill(2) argument: groups negative, pids positive, root group first. */
 function targetsOf(plan: TreeKillPlan): number[] {
-  if (plan.refused) return [];
+  if (plan.refused || plan.refusal) return [];
   if (!Number.isInteger(plan.rootPid) || plan.rootPid <= 1) return [];
   const ok = (n: number) => Number.isInteger(n) && n > 1;
   return [

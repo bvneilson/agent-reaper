@@ -1,9 +1,19 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { fileURLToPath } from "node:url";
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { killTree, openPromptStdin, spawnSupervised, type SupervisedOptions } from "../src/index.js";
 
 // Real processes, so this file runs only after the unit files pass (see the test script).
@@ -249,11 +259,19 @@ describe("spawnSupervised", () => {
     expect(await gone(s)).toBe(true);
   });
 
-  test("a normal exit that leaves nothing behind does not wait out the grace", SLOW, async () => {
-    const started = Date.now();
-    const { sup } = supervise("", { graceMs: 20_000 });
-    expect(await sup.done).toEqual({ code: 0, signal: null, timedOut: false, reaped: 0 });
-    expect(Date.now() - started).toBeLessThan(10_000);
+  test("a normal exit that leaves nothing behind signals nothing and does not wait out the grace", SLOW, async () => {
+    // The child's pid is free once it has exited, so with nothing left in its group even a
+    // group signal could only reach a stranger. The spy passes every call through.
+    const spy = vi.spyOn(process, "kill");
+    try {
+      const started = Date.now();
+      const { sup } = supervise("", { graceMs: 20_000 });
+      expect(await sup.done).toEqual({ code: 0, signal: null, timedOut: false, reaped: 0 });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("the child gets opts.env (or this process's env) without the stripEnv names", SLOW, async () => {
@@ -292,6 +310,65 @@ describe("spawnSupervised", () => {
     expect(sup.child.pid).toBeUndefined();
     await expect(sup.done).rejects.toMatchObject({ code: "ENOENT" });
     await expect(sup.kill()).resolves.toBeUndefined();
+  });
+});
+
+describe("a process that awaits done", () => {
+  // A separate node process, so nothing of the test runner keeps its event loop alive. It imports
+  // a copy of the library compiled for this test (CI runs the tests before the build).
+  const ROOT = fileURLToPath(new URL("..", import.meta.url));
+  let dir = "";
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "reaper-awaits-done-"));
+    const tsc = join(ROOT, "node_modules", "typescript", "bin", "tsc");
+    const project = join(ROOT, "tsconfig.build.json");
+    execFileSync(NODE, [tsc, "-p", project, "--outDir", join(dir, "lib")], { stdio: "pipe" });
+    writeFileSync(join(dir, "package.json"), '{ "type": "module" }\n');
+    writeFileSync(
+      join(dir, "run.mjs"),
+      `import { createInterface } from "node:readline";
+      import { spawnSupervised } from "./lib/index.js";
+      const sup = spawnSupervised(process.execPath, ["-e", process.argv[2]], { timeoutMs: 3000, graceMs: 1500 });
+      console.log(JSON.stringify({ pids: { child: sup.child.pid } }));
+      createInterface({ input: sup.child.stdout }).on("line", (line) => console.log(line));
+      sup.child.stderr.resume();
+      console.log(JSON.stringify({ done: await sup.done }));
+      `,
+    );
+  }, 30_000);
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does not exit before the grace ends and the survivors are SIGKILLed", SLOW, async () => {
+    // The child dies on SIGTERM. Its grandchild, in a session of its own and holding none of
+    // the runner's pipes, ignores SIGTERM and marks a file when it gets one. Through the
+    // grace, only the grace timer can keep the runner alive.
+    const mark = join(dir, "took-sigterm");
+    const stubborn = `process.on("SIGTERM", () => require("fs").writeFileSync(process.env.REAPER_MARK, "term"));
+      console.log(JSON.stringify({ g: process.pid }));
+      ${SLEEP};`;
+    const child = `${SPAWN};
+      const stdio = ["ignore", "pipe", "ignore"];
+      const g = spawn(process.execPath, ["-e", ${JSON.stringify(stubborn)}], { detached: true, stdio });
+      let out = "";
+      g.stdout.setEncoding("utf8");
+      g.stdout.on("data", (c) => {
+        out += c;
+        if (out.includes("\\n")) console.log(JSON.stringify({ pids: { g: JSON.parse(out).g } }));
+      });
+      ${SLEEP};`;
+    const runner = spawn(NODE, [join(dir, "run.mjs"), child], {
+      env: { ...process.env, REAPER_MARK: mark },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exited = new Promise<number | null>((resolve) => runner.once("exit", (code) => resolve(code)));
+    const { waitFor } = watch(runner);
+    const { g } = await waitFor("child", "g");
+    expect(await exited).toBe(0);
+    expect((await waitFor("done")).done).toMatchObject({ timedOut: true, signal: "SIGTERM" });
+    expect(existsSync(mark)).toBe(true); // the grandchild took the SIGTERM and lived through it
+    expect(await gone(g)).toBe(true);
   });
 });
 

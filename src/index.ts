@@ -9,7 +9,7 @@ export {
   snapshotProcessTable,
   snapshotProcessTableAsync,
 } from "./tree.js";
-export type { KillFn, ProcRow, TreeKillPlan, TreeSignalResult } from "./tree.js";
+export type { KillFn, ProcRow, TreeKillPlan, TreeKillRefusal, TreeSignalResult } from "./tree.js";
 export { withoutEnv } from "./env.js";
 export { openPromptStdin } from "./prompt.js";
 export { DEFAULT_GRACE_MS, killTree, spawnSupervised } from "./spawn.js";

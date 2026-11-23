@@ -26,8 +26,8 @@ describe("planChildKill", () => {
     // Shaped like a live child with a grandchild, so only the exit makes it a stranger's tree.
     const table = [...BASE, row(CHILD, 1, CHILD), row(5_000_200, CHILD, 5_000_200)];
     const plan = planChildKill(CHILD, table, false);
-    expect(plan.refused).toBe("the root's pid was reused after it exited");
-    expect(plan).toMatchObject({ rootPid: CHILD, groups: [], pids: [] });
+    expect(plan?.refused).toBe("the root's pid was reused after it exited");
+    expect(plan).toMatchObject({ rootPid: CHILD, groups: [], pids: [], refusal: "pid-reused" });
   });
 
   test("exited: planned from the members its group still has, and what they started", () => {
@@ -36,11 +36,36 @@ describe("planChildKill", () => {
     expect(planChildKill(CHILD, table, false)).toEqual({ rootPid: CHILD, groups: [5_000_400], pids: [] });
   });
 
-  test("exited with nothing left in its group: the group-only plan, which finds nothing to signal", () => {
-    expect(planChildKill(CHILD, [...BASE, row(5_000_500, 1, 5_000_500)], false)).toEqual({
+  test("exited, and the snapshot shows nothing left of its group: nothing to signal", () => {
+    // Its pid is free by now, so even its group id may name a stranger's new group.
+    expect(planChildKill(CHILD, [...BASE, row(5_000_500, 1, 5_000_500)], false)).toBeNull();
+  });
+
+  test("exited, with a snapshot that lacks our own row: treated as no snapshot, the group-only plan", () => {
+    expect(planChildKill(CHILD, [row(1, 0, 1), row(5_000_500, 1, 5_000_500)], false)).toEqual({
       rootPid: CHILD,
       groups: [],
       pids: [],
     });
+  });
+});
+
+describe("planChildKill when ps hides one of our ancestors", () => {
+  // Our parent's row is missing, as under a ps that hides other users' processes.
+  const HIDDEN = [row(1, 0, 1), row(SELF, 5_000_900, SELF)];
+
+  test("the child still runs: the group-only plan, since its own group is provably ours", () => {
+    const table = [...HIDDEN, row(CHILD, SELF, CHILD), row(5_000_200, CHILD, 5_000_200)];
+    expect(planChildKill(CHILD, table, true)).toEqual({ rootPid: CHILD, groups: [], pids: [] });
+  });
+
+  test("the child has exited: still refused, nothing is signaled", () => {
+    const table = [...HIDDEN, row(5_000_300, 1, CHILD)];
+    expect(planChildKill(CHILD, table, false)).toMatchObject({ groups: [], pids: [], refusal: "unknown-ancestry" });
+  });
+
+  test("any other refusal still signals nothing, even while the child runs", () => {
+    const table = [...HIDDEN, row(CHILD, SELF, SELF)]; // the child's row sits in our own group
+    expect(planChildKill(CHILD, table, true)).toMatchObject({ groups: [], pids: [], refusal: "in-our-group" });
   });
 });
