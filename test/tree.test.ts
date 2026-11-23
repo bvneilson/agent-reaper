@@ -183,8 +183,7 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
     expect(plan.pids).toEqual([2001, 2002]);
   });
 
-
-  test("an ancestor row missing from the table never puts its group in groups", () => {
+  test("an ancestor row missing from the table refuses the plan", () => {
     const table = [
       row(1, 0, 1),
       row(300, 1, 300),
@@ -196,9 +195,39 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
       row(2002, 2001, 400),
     ];
     const plan = planTreeKill(1000, table, SELF)!;
-    expect(plan.refused).toBeUndefined();
-    expect(plan.groups).toEqual([2000]);
-    expect(plan.pids).toEqual([2001, 2002]);
+    expect(plan.refused).toBe("the snapshot does not show this process's ancestors back to pid 1");
+    expect(plan.groups).toEqual([]);
+    expect(plan.pids).toEqual([]);
+  });
+
+  test("our parent's row missing with the root above us: refused, and nothing is signaled", () => {
+    // The root 1000 is our great-grandparent. With 400 missing, the walk cannot see 300 or 1000
+    // as ancestors, so without the refusal the plan would hold -1000 and -300.
+    const table = [
+      row(1, 0, 1),
+      row(1000, 1, 1000),
+      row(300, 1000, 300),
+      // 400 (our parent, child of 300) is absent
+      row(SELF, 400, SELF),
+    ];
+    const plan = planTreeKill(1000, table, SELF)!;
+    expect(plan.refused).toBe("the snapshot does not show this process's ancestors back to pid 1");
+    const os = fakeOs([...table, row(400, 300, 400)]);
+    expect(signalTree(plan, "SIGTERM", os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(os.calls).toEqual([]);
+  });
+
+  test("a ppid cycle in our own ancestry refuses the plan", () => {
+    const table = [
+      row(1, 0, 1),
+      row(SELF, 400, SELF),
+      row(400, 300, 400), // 400 and 300 name each other as parent: a racy table
+      row(300, 400, 300),
+      row(1000, SELF, 1000),
+    ];
+    expect(planTreeKill(1000, table, SELF)!.refused).toBe(
+      "the snapshot does not show this process's ancestors back to pid 1",
+    );
   });
 
   test("an ancestor printed with an empty comm is parsed, and its group is not signaled whole", () => {
@@ -217,9 +246,16 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
     expect(plan.pids).toEqual([2001, 2002]);
   });
 
-  test("a group that holds our own pid is never signaled whole, even with our row's pgid elsewhere", () => {
-    // 2001 sits in a group led by our pid. Our pid's group must not be signaled.
-    const table = [...BASE, row(1000, 1, 1000), row(2000, 1000, 2000), row(2001, 2000, SELF)];
+  test("a group whose id is our pid is never signaled whole, even when our own row sits in another group", () => {
+    // Our row is in group 600, so only the `pgid !== selfPid` rule keeps group SELF (which holds
+    // 2001 and nothing outside the tree) from being signaled whole.
+    const table = [
+      row(1, 0, 1),
+      row(SELF, 1, 600),
+      row(1000, 1, 1000),
+      row(2000, 1000, 2000),
+      row(2001, 2000, SELF),
+    ];
     const plan = planTreeKill(1000, table, SELF)!;
     expect(plan.groups).toEqual([2000]);
     expect(plan.pids).toEqual([2001]);
@@ -386,8 +422,8 @@ describe("signalTree", () => {
   test("SIGTERM, then SIGKILL on the survivors of the same plan", () => {
     const os = fakeOs(TREE, new Set([1000, 1001])); // the shell ignores TERM
     const p = plan();
-    signalTree(p, "SIGTERM", os.kill);
-    const r = killTreeSurvivors(p, os.kill);
+    const first = signalTree(p, "SIGTERM", os.kill);
+    const r = killTreeSurvivors(p, os.kill, first);
     expect(os.calls.filter(([, s]) => s === "SIGKILL")).toEqual([[-2000, "SIGKILL"]]);
     expect(r.signaled).toEqual([-2000]);
     expect(r.gone).toEqual([-1000]); // already dead, not signaled again
@@ -442,8 +478,9 @@ describe("signalTree", () => {
     const refused = planTreeKill(1000, table, SELF)!;
     expect(refused.refused).toBeDefined();
     const os = fakeOs(table);
-    expect(signalTree(refused, "SIGTERM", os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
-    expect(killTreeSurvivors(refused, os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
+    const first = signalTree(refused, "SIGTERM", os.kill);
+    expect(first).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(killTreeSurvivors(refused, os.kill, first)).toEqual({ signaled: [], denied: [], gone: [] });
     expect(os.calls).toEqual([]);
   });
 
@@ -464,8 +501,8 @@ describe("signalTree", () => {
     const p = planTreeKill(1000, TREE, SELF)!;
     expect(p.pids).not.toContain(4000);
     const os = fakeOs([...TREE, row(4000, 1, 4000)]);
-    signalTree(p, "SIGTERM", os.kill);
-    killTreeSurvivors(p, os.kill);
+    const first = signalTree(p, "SIGTERM", os.kill);
+    killTreeSurvivors(p, os.kill, first);
     for (const [target] of os.calls) expect(Math.abs(target)).not.toBe(4000);
     expect(os.live.has(4000)).toBe(true);
   });
@@ -503,6 +540,15 @@ describe("killTreeSurvivors after a clean first pass", () => {
     expect(r).toEqual({ signaled: [], denied: [], gone: [] });
     expect(os.calls).toEqual([]);
   });
+
+  test("a missing first-pass result (plain JavaScript) sends nothing", () => {
+    const os = fakeOs(TREE);
+    const p = planTreeKill(1000, TREE, SELF)!;
+    // @ts-expect-error `first` is required: the root-EPERM gate can never be skipped by omission
+    const r = killTreeSurvivors(p, os.kill);
+    expect(r).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(os.calls).toEqual([]);
+  });
 });
 
 describe("a kill that throws something odd", () => {
@@ -513,7 +559,7 @@ describe("a kill that throws something odd", () => {
         throw thrown;
       };
       expect(() => signalTree(p, "SIGTERM", kill)).not.toThrow();
-      expect(() => killTreeSurvivors(p, kill)).not.toThrow();
+      expect(() => killTreeSurvivors(p, kill, { signaled: [-1000], denied: [], gone: [] })).not.toThrow();
       expect(() => processGroupAlive(1234, kill)).not.toThrow();
       expect(signalTree(p, "SIGTERM", kill).denied).toEqual([-1000]);
       expect(processGroupAlive(1234, kill)).toBe(false);

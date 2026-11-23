@@ -22,7 +22,9 @@ import { execFile, execFileSync } from "node:child_process";
 //      signaled in any case: a pid or group id of 1 or less, our own pid, our
 //      own group, or any ancestor of ours. A root that is us, leads or sits in
 //      our group, or has us or one of our ancestors beneath it is refused as a
-//      whole, and nothing is signaled.
+//      whole, and nothing is signaled. So is any plan from a snapshot that does
+//      not show our ancestors all the way up, since an ancestor the snapshot
+//      cannot see cannot be kept out of the plan.
 //   4. When no usable snapshot exists (ps missing, slow, or garbage), the
 //      caller falls back to a group-only plan. Nothing here throws.
 //
@@ -91,8 +93,8 @@ function normalizeTimeout(timeoutMs: number): number | null {
  * Pure. Parses the output of `ps -Ao pid=,ppid=,pgid=,comm=`. A row is three
  * integers followed by the rest of the line as `comm` (which may contain
  * spaces, and may be empty: pid, ppid and pgid carry the safety, and dropping
- * a row would let a group look wholly inside the tree). Anything else, such as a header, a short row, or an empty line, is
- * skipped.
+ * a row would let a group look wholly inside the tree). Anything else, such as
+ * a header, a short row, or an empty line, is skipped.
  */
 export function parseProcTable(raw: string): ProcRow[] {
   const rows: ProcRow[] = [];
@@ -160,6 +162,8 @@ export function snapshotProcessTableAsync(
   });
 }
 
+const UNKNOWN_ANCESTRY = "the snapshot does not show this process's ancestors back to pid 1";
+
 /**
  * Pure. Plans which groups and pids killing `rootPid`'s tree may signal, from
  * one snapshot.
@@ -171,11 +175,15 @@ export function snapshotProcessTableAsync(
  * - a plan with `refused` set, and empty `pids` and `groups`, when signaling
  *   would hit us: the root is us or has a pid of 1 or less, leads or sits in
  *   our process group, or has us or one of our ancestors beneath it (or in its
- *   group). {@link signalTree} signals nothing for such a plan.
- * - otherwise a plan. It never contains `selfPid`, our ancestors, our group,
- *   or any pid or group id of 1 or less, and a group is signaled whole only
- *   when every member the snapshot shows is in the tree and the group is
- *   neither ours nor an ancestor's (even one whose row is missing).
+ *   group). Also when the snapshot does not show our ancestors back to pid 1
+ *   (or to a parent pid of 0): a row missing on the way up, or a ppid cycle,
+ *   leaves every ancestor above that point unknown, and an unknown ancestor
+ *   could be planned as part of the tree. {@link signalTree} signals nothing
+ *   for a refused plan.
+ * - otherwise a plan. Every ancestor of ours is then known, and the plan never
+ *   contains `selfPid`, our ancestors, our group, or any pid or group id of 1
+ *   or less. A group is signaled whole only when every member the snapshot
+ *   shows is in the tree and the group is neither ours nor an ancestor's.
  *
  * `opts.rootLedGroup` is for a root spawned as a process group leader (detached)
  * that may already have exited. When it is true and the root's row is absent,
@@ -208,10 +216,17 @@ export function planTreeKill(
   if (rootPid === self.pgid) return refuse("the root leads this process's group");
   if (root && root.pgid === self.pgid) return refuse("the root is in this process's group");
 
-  // Our ancestors, from the snapshot. A visited set stops a racy ppid cycle.
+  // Our ancestors, from the snapshot, up to pid 1 (or a parent pid of 0, the
+  // top of what this process can see). A missing row or a racy ppid cycle on
+  // the way up leaves the rest of our ancestry unknown: refuse, fail closed.
   const ancestors = new Set<number>();
-  for (let p = self.ppid; p > 0 && !ancestors.has(p); p = rows.get(p)?.ppid ?? 0) {
+  for (let p = self.ppid; p > 0; ) {
+    if (ancestors.has(p)) return refuse(UNKNOWN_ANCESTRY);
     ancestors.add(p);
+    if (p === 1) break;
+    const up = rows.get(p);
+    if (!up) return refuse(UNKNOWN_ANCESTRY);
+    p = up.ppid;
   }
 
   const add = (map: Map<number, number[]>, key: number, pid: number) => {
@@ -376,18 +391,22 @@ export function signalTree(
  * snapshot, and a refused plan signals nothing.
  *
  * The "root group EPERM means it is not ours" gate belongs to the FIRST pass
- * only. Pass that pass's result as `first`: if it was denied on the root group,
- * nothing is sent here. Otherwise the root group was ours when the first signal
- * went out, and an EPERM now (a member we may not signal keeps it alive) is
- * reported in `denied` without stopping the other survivors. With no `first`,
- * the pass likewise continues past a root EPERM.
+ * only, so `first` (that pass's {@link signalTree} result) is required. If the
+ * first pass was denied on the root group, nothing is sent here. Otherwise the
+ * root group was ours when the first signal went out, and an EPERM now (a
+ * member we may not signal keeps it alive) is reported in `denied` without
+ * stopping the other survivors. A `first` that is missing or malformed (only
+ * possible from plain JavaScript) sends nothing. Pass `undefined` as `kill` for
+ * the real `process.kill`.
  */
 export function killTreeSurvivors(
   plan: TreeKillPlan,
-  kill: KillFn = defaultKill,
-  first?: TreeSignalResult,
+  kill: KillFn | undefined = defaultKill,
+  first: TreeSignalResult,
 ): TreeSignalResult {
-  if (first && first.denied.includes(-plan.rootPid)) return { signaled: [], denied: [], gone: [] };
+  if (!Array.isArray(first?.denied) || first.denied.includes(-plan.rootPid)) {
+    return { signaled: [], denied: [], gone: [] };
+  }
   return deliver(plan, "SIGKILL", kill, true, false);
 }
 
