@@ -6,7 +6,7 @@ Documentation and hardening. No change to the default behavior of a kill.
 
 - README: the Guarantees now say which hold only with a usable `ps` snapshot. New Limits for the no-snapshot state, for a supervisor that dies, for processes started after the snapshot, and for recycled group ids.
 - README: a SIGINT and SIGTERM handler in Usage, `KillTreeOptions`, the `stripEnv` `.env` caveat, and ESM only.
-- `timeoutMs: Infinity` (and NaN) now means no timeout. It was clamped to about 24.8 days.
+- `timeoutMs: Infinity` (and NaN) now means no timeout. It was clamped to about 24.86 days.
 - `groupOnlyPlan` always refuses the real `process.pid` and `process.ppid`, so `pids.map(groupOnlyPlan)` from plain JavaScript can no longer plan this process. `planTreeKill` accepts a null `opts`.
 - `ps` is SIGKILLed, not SIGTERMed, when it outlives the snapshot timeout.
 - `spawnSupervised` accepts `readonly string[]` for `args`.

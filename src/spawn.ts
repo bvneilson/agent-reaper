@@ -60,7 +60,7 @@ export interface SupervisedOptions {
   prompt?: string;
   /**
    * Kill the tree this many ms after the spawn. Unset, 0 or less, NaN and
-   * Infinity: no timeout. A finite value above 2147483647 (about 24.8 days) is
+   * Infinity: no timeout. A finite value above 2147483647 (about 24.86 days) is
    * clamped to it.
    */
   timeoutMs?: number;

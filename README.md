@@ -93,7 +93,7 @@ Types: `SupervisedOptions`, `Supervised`, `SupervisedResult`, `KillTreeOptions`,
 | `env` | `process.env` | The child's environment, before `stripEnv` applies. |
 | `stripEnv` | none | Names removed from the child's environment. A runtime that loads `.env` from its working directory can restore a removed name. Set it to `""` in `env` instead. |
 | `prompt` | none | Text handed to the child as stdin, through a file. Without it, stdin is the null device. |
-| `timeoutMs` | no timeout | Kill the tree this many ms after the spawn. Unset, 0 or less, NaN and `Infinity` mean no timeout. A finite value above 2147483647 (about 24.8 days) is clamped to it. |
+| `timeoutMs` | no timeout | Kill the tree this many ms after the spawn. Unset, 0 or less, NaN and `Infinity` mean no timeout. A finite value above 2147483647 (about 24.86 days) is clamped to it. |
 | `graceMs` | 5000 | Ms between the first signal and the SIGKILL of survivors. 0 or less SIGKILLs right away. |
 | `snapshotTimeoutMs` | 2000 | Bound on each `ps` read. 0 or less skips the snapshot, and only the child's own group is signaled. |
 
@@ -138,12 +138,12 @@ Each of these has a test behind it. The unit tests inject the kill function and 
 - POSIX only, and `ps` must be on the path. On Windows it does not work.
 - If this process dies or is interrupted, its supervised trees are not reaped. The child runs in a session of its own, so a terminal's Ctrl-C reaches this process but not the agent. A SIGTERM, a SIGKILL or a crash behaves the same way, and the agent keeps running. Handle SIGINT and SIGTERM and call `kill()` before exiting, as in Usage. Nothing can catch a SIGKILL.
 - Without a usable snapshot (`ps` missing, failing or slow, or `snapshotTimeoutMs` 0 or less), only the root's own group is signaled. Descendants in other groups or sessions survive. This is common in minimal containers, which often ship without `ps`. In that state `groupOnlyPlan`, and so `killTree`, can refuse only this process and its parent. It cannot refuse our own group when we do not lead it, or a grandparent or deeper ancestor. Pass `killTree` only the pids of trees you started detached.
-- Without a usable snapshot, the reap after a normal exit signals the child's old group id once, although its pid may already be free.
+- Without a usable snapshot, the reap after a normal exit signals the child's old group id, although its pid may already be free. If a stranger now leads a group with that id, it gets the SIGTERM, then the SIGKILL after the grace.
 - A descendant that leaves the child's group and outlives its parent before any kill cannot be traced back to the child. Once the parent is gone, it is reparented to init, and the table cannot tell it from a stranger's process.
 - A process started after the snapshot, outside the groups the plan signals whole (in a new session during the grace, for example), is not reached.
 - A pid or group id in the plan can be recycled during the grace window and still receive the SIGKILL. The child's own group id is the likeliest. This applies to every `spawnSupervised` reap, because Node collects the child right after the first signal.
 - Where `ps` hides this process's ancestors (Linux hidepid, some sandboxes), plans are refused. `spawnSupervised` then kills only the running child's own group, not descendants in other groups or sessions. `killTree` signals nothing.
-- If a reap signals nothing while the child keeps running (EPERM on a setuid command, for example), supervision of that child ends.
+- If a reap signals nothing while the child keeps running (EPERM on a setuid command, for example), supervision of that child ends. The Usage stop pattern can then wait indefinitely, because `done` never settles while the child runs and further SIGINT and SIGTERM are ignored. Only a SIGKILL stops the supervisor in that case.
 - While a kill is in flight, the grace timer keeps the process alive for up to `graceMs`.
 - A child that writes to stdout or stderr that nobody reads can block on the write. Read the pipes or call `.resume()` on them.
 
