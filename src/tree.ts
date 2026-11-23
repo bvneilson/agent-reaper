@@ -78,12 +78,20 @@ export const DEFAULT_SNAPSHOT_TIMEOUT_MS = 2000;
 
 const PS_ARGS = ["-Ao", "pid=,ppid=,pgid=,comm="];
 const PS_MAX_BUFFER = 16 * 1024 * 1024;
-const PS_ROW = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S.*?)\s*$/;
+const PS_ROW = /^\s*(\d+)\s+(\d+)\s+(\d+)(?:\s+(.*?))?\s*$/;
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** Whole milliseconds node accepts, or null for a timeout that means "skip". */
+function normalizeTimeout(timeoutMs: number): number | null {
+  if (!(timeoutMs > 0)) return null;
+  return Math.min(Math.ceil(timeoutMs), MAX_TIMER_MS);
+}
 
 /**
  * Pure. Parses the output of `ps -Ao pid=,ppid=,pgid=,comm=`. A row is three
  * integers followed by the rest of the line as `comm` (which may contain
- * spaces). Anything else, such as a header, a short row, or an empty line, is
+ * spaces, and may be empty: pid, ppid and pgid carry the safety, and dropping
+ * a row would let a group look wholly inside the tree). Anything else, such as a header, a short row, or an empty line, is
  * skipped.
  */
 export function parseProcTable(raw: string): ProcRow[] {
@@ -91,7 +99,7 @@ export function parseProcTable(raw: string): ProcRow[] {
   for (const line of raw.split("\n")) {
     const m = PS_ROW.exec(line);
     if (m) {
-      rows.push({ pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), comm: m[4] });
+      rows.push({ pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), comm: m[4] ?? "" });
     }
   }
   return rows;
@@ -105,11 +113,12 @@ export function parseProcTable(raw: string): ProcRow[] {
 export function snapshotProcessTable(
   timeoutMs: number = DEFAULT_SNAPSHOT_TIMEOUT_MS,
 ): ProcRow[] | null {
-  if (!(timeoutMs > 0)) return null;
+  const ms = normalizeTimeout(timeoutMs);
+  if (ms === null) return null;
   try {
     const out = execFileSync("ps", PS_ARGS, {
       encoding: "utf-8",
-      timeout: timeoutMs,
+      timeout: ms,
       maxBuffer: PS_MAX_BUFFER,
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -123,19 +132,21 @@ export function snapshotProcessTable(
 /**
  * Async twin of {@link snapshotProcessTable}. Settles within `timeoutMs` even
  * if `ps` hangs, and never rejects. Returns null without spawning `ps` when
- * `timeoutMs <= 0`.
+ * `timeoutMs <= 0`. A fractional timeout is rounded up and an oversized one is
+ * clamped to the largest timer value.
  */
 export function snapshotProcessTableAsync(
   timeoutMs: number = DEFAULT_SNAPSHOT_TIMEOUT_MS,
 ): Promise<ProcRow[] | null> {
-  if (!(timeoutMs > 0)) return Promise.resolve(null);
+  const ms = normalizeTimeout(timeoutMs);
+  if (ms === null) return Promise.resolve(null);
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), timeoutMs);
+    const timer = setTimeout(() => resolve(null), ms);
     try {
       execFile(
         "ps",
         PS_ARGS,
-        { encoding: "utf-8", timeout: timeoutMs, maxBuffer: PS_MAX_BUFFER },
+        { encoding: "utf-8", timeout: ms, maxBuffer: PS_MAX_BUFFER },
         (err, stdout) => {
           clearTimeout(timer);
           const rows = err ? [] : parseProcTable(stdout);
@@ -154,20 +165,35 @@ export function snapshotProcessTableAsync(
  * one snapshot.
  *
  * Returns:
- * - `null` when the snapshot cannot support a plan: it lacks the root's row or
- *   our own row (`selfPid`). The caller should fall back to
- *   {@link groupOnlyPlan}.
+ * - `null` when the snapshot cannot support a plan: it lacks our own row
+ *   (`selfPid`), or lacks the root's row (unless `rootLedGroup`, below, finds
+ *   survivors). The caller should fall back to {@link groupOnlyPlan}.
  * - a plan with `refused` set, and empty `pids` and `groups`, when signaling
  *   would hit us: the root is us or has a pid of 1 or less, leads or sits in
  *   our process group, or has us or one of our ancestors beneath it (or in its
  *   group). {@link signalTree} signals nothing for such a plan.
  * - otherwise a plan. It never contains `selfPid`, our ancestors, our group,
- *   or any pid or group id of 1 or less.
+ *   or any pid or group id of 1 or less, and a group is signaled whole only
+ *   when every member the snapshot shows is in the tree and the group is
+ *   neither ours nor an ancestor's (even one whose row is missing).
+ *
+ * `opts.rootLedGroup` is for a root spawned as a process group leader (detached)
+ * that may already have exited. When it is true and the root's row is absent,
+ * the plan is built from the surviving members of the root's group (rows with
+ * `pgid === rootPid`) and everything below them, under every usual exclusion.
+ * POSIX does not reuse a pid while a process group with that id still exists,
+ * so those members really are the root's group, and this reaches shells that a
+ * surviving background process moved to groups of their own. If no member of
+ * that group survives, the result is null. Without the flag an absent root
+ * returns null, because a bare pid with no row cannot be told from a recycled
+ * one. A caller that knows the root exited must refuse the plan itself when
+ * the table still holds a row with `pid === rootPid` (the pid was reused).
  */
 export function planTreeKill(
   rootPid: number,
   table: readonly ProcRow[],
   selfPid: number,
+  opts: { rootLedGroup?: boolean } = {},
 ): TreeKillPlan | null {
   const refuse = (why: string): TreeKillPlan => ({ rootPid, groups: [], pids: [], refused: why });
   if (!Number.isInteger(rootPid) || rootPid <= 1) {
@@ -176,10 +202,11 @@ export function planTreeKill(
   const rows = new Map(table.map((r) => [r.pid, r]));
   const self = rows.get(selfPid);
   const root = rows.get(rootPid);
-  if (!self || !root) return null;
+  if (!self) return null;
+  if (!root && !(opts.rootLedGroup && table.some((r) => r.pgid === rootPid))) return null;
   if (rootPid === selfPid) return refuse("the root is this process");
   if (rootPid === self.pgid) return refuse("the root leads this process's group");
-  if (root.pgid === self.pgid) return refuse("the root is in this process's group");
+  if (root && root.pgid === self.pgid) return refuse("the root is in this process's group");
 
   // Our ancestors, from the snapshot. A visited set stops a racy ppid cycle.
   const ancestors = new Set<number>();
@@ -208,10 +235,10 @@ export function planTreeKill(
     tree.add(pid);
     for (const child of children.get(pid) ?? []) if (!tree.has(child)) queue.push(child);
   }
+  // Any ancestor of ours in the tree has us in it too (both walks follow ppid),
+  // so this one check covers ancestors as well. Ancestors are still excluded by
+  // pid and by group below, as defense in depth.
   if (tree.has(selfPid)) return refuse("this process is inside the tree");
-  for (const a of ancestors) {
-    if (tree.has(a)) return refuse("an ancestor of this process is inside the tree");
-  }
 
   const byGroup = new Map<number, number[]>();
   for (const pid of tree) {
@@ -223,7 +250,11 @@ export function planTreeKill(
   const pids: number[] = [];
   for (const [pgid, inTree] of byGroup) {
     const whole =
-      pgid > 1 && pgid !== self.pgid && (members.get(pgid) ?? []).every((m) => tree.has(m));
+      pgid > 1 &&
+      pgid !== self.pgid &&
+      pgid !== selfPid &&
+      !ancestors.has(pgid) &&
+      (members.get(pgid) ?? []).every((m) => tree.has(m));
     if (whole) groups.push(pgid);
     else {
       pids.push(...inTree.filter((pid) => pid > 1 && pid !== selfPid && !ancestors.has(pid)));
@@ -235,14 +266,21 @@ export function planTreeKill(
 
 /**
  * The fallback plan: signal the root's group and nothing else. Use it when no
- * usable snapshot exists. A pid of 1 or less (or a non-integer) is refused.
- * Without a table this cannot check whether the group is ours, so callers must
+ * usable snapshot exists. A pid of 1 or less (or a non-integer), `selfPid`,
+ * and our parent are refused. The parent is known without a table only when
+ * `selfPid` is left at its default (this process), or when `parentPid` is
+ * given. Deeper ancestors cannot be checked without a table, so callers must
  * spawn the root detached (as its own group leader).
  */
-export function groupOnlyPlan(pid: number): TreeKillPlan {
-  if (!Number.isInteger(pid) || pid <= 1) {
-    return { rootPid: pid, groups: [], pids: [], refused: `pid ${pid} is never signaled` };
-  }
+export function groupOnlyPlan(
+  pid: number,
+  selfPid: number = process.pid,
+  parentPid: number | undefined = selfPid === process.pid ? process.ppid : undefined,
+): TreeKillPlan {
+  const refuse = (why: string): TreeKillPlan => ({ rootPid: pid, groups: [], pids: [], refused: why });
+  if (!Number.isInteger(pid) || pid <= 1) return refuse(`pid ${pid} is never signaled`);
+  if (pid === selfPid) return refuse("the root is this process");
+  if (pid === parentPid) return refuse("the root is the parent of this process");
   return { rootPid: pid, groups: [], pids: [] };
 }
 
@@ -262,6 +300,11 @@ function targetsOf(plan: TreeKillPlan): number[] {
   ];
 }
 
+/** The errno code of whatever a kill threw. An injected kill may throw anything, even nothing. */
+function errCode(err: unknown): unknown {
+  return (err as { code?: unknown } | null | undefined)?.code;
+}
+
 type Answer = "sent" | "gone" | "denied";
 
 function send(target: number, signal: NodeJS.Signals, kill: KillFn): Answer {
@@ -269,8 +312,7 @@ function send(target: number, signal: NodeJS.Signals, kill: KillFn): Answer {
     kill(target, signal);
     return "sent";
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return "gone";
+    if (errCode(err) === "ESRCH") return "gone";
     return "denied";
   }
 }
@@ -281,7 +323,7 @@ function alive(target: number, kill: KillFn): boolean {
     return true;
   } catch (err) {
     // EPERM means it exists and is not ours to signal.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
+    return errCode(err) === "EPERM";
   }
 }
 
@@ -290,6 +332,7 @@ function deliver(
   signal: NodeJS.Signals,
   kill: KillFn,
   onlyAlive: boolean,
+  stopOnRootDenied: boolean,
 ): TreeSignalResult {
   const result: TreeSignalResult = { signaled: [], denied: [], gone: [] };
   const [rootTarget, ...rest] = targetsOf(plan);
@@ -303,12 +346,12 @@ function deliver(
     else if (answer === "gone") result.gone.push(target);
     else result.denied.push(target);
   };
-  // EPERM on the root group means the root is not ours, so nothing under it is
-  // either. Stop. A root that is already gone does not stop the rest: its
-  // descendants must still be reached.
+  // On the first pass, EPERM on the root group means the root is not ours, so
+  // nothing under it is either: stop. A root that is already gone does not stop
+  // the rest, since its descendants must still be reached.
   const rootAnswer = one(rootTarget);
   record(rootTarget, rootAnswer);
-  if (rootAnswer === "denied") return result;
+  if (rootAnswer === "denied" && stopOnRootDenied) return result;
   for (const target of rest) record(target, one(target));
   return result;
 }
@@ -324,19 +367,28 @@ export function signalTree(
   signal: NodeJS.Signals,
   kill: KillFn = defaultKill,
 ): TreeSignalResult {
-  return deliver(plan, signal, kill, false);
+  return deliver(plan, signal, kill, false, true);
 }
 
 /**
  * After the grace period: SIGKILLs every target of the SAME plan that is still
- * alive. Targets found dead are reported in `gone`. Same refusal and EPERM
- * rules as {@link signalTree}. Never takes a second snapshot.
+ * alive. Targets found dead are reported in `gone`. Never takes a second
+ * snapshot, and a refused plan signals nothing.
+ *
+ * The "root group EPERM means it is not ours" gate belongs to the FIRST pass
+ * only. Pass that pass's result as `first`: if it was denied on the root group,
+ * nothing is sent here. Otherwise the root group was ours when the first signal
+ * went out, and an EPERM now (a member we may not signal keeps it alive) is
+ * reported in `denied` without stopping the other survivors. With no `first`,
+ * the pass likewise continues past a root EPERM.
  */
 export function killTreeSurvivors(
   plan: TreeKillPlan,
   kill: KillFn = defaultKill,
+  first?: TreeSignalResult,
 ): TreeSignalResult {
-  return deliver(plan, "SIGKILL", kill, true);
+  if (first && first.denied.includes(-plan.rootPid)) return { signaled: [], denied: [], gone: [] };
+  return deliver(plan, "SIGKILL", kill, true, false);
 }
 
 /**

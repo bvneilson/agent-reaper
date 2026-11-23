@@ -31,3 +31,29 @@ describe("a non-positive snapshot timeout never spawns ps", () => {
     expect(spawned.sync.mock.calls[0][1]).toEqual(["-Ao", "pid=,ppid=,pgid=,comm="]);
   });
 });
+
+describe("the timeout is normalized before it reaches node", () => {
+  beforeEach(() => {
+    spawned.sync.mockReset();
+    spawned.async.mockReset();
+  });
+
+  test("a fractional timeout is rounded up to an integer, not dropped", () => {
+    spawned.sync.mockReturnValue("  7  1  7 node\n");
+    expect(snapshotProcessTable(50.5)).not.toBeNull();
+    expect(spawned.sync.mock.calls[0][2].timeout).toBe(51);
+  });
+
+  test("an oversized timeout is clamped to the largest timer value, sync and async", async () => {
+    spawned.sync.mockReturnValue("  7  1  7 node\n");
+    snapshotProcessTable(2 ** 40);
+    expect(spawned.sync.mock.calls[0][2].timeout).toBe(2 ** 31 - 1);
+    let pending = true;
+    void snapshotProcessTableAsync(2 ** 40).then(() => {
+      pending = false;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(spawned.async.mock.calls[0][2].timeout).toBe(2 ** 31 - 1);
+    expect(pending).toBe(true); // the timer did not fire after 1 ms
+  });
+});

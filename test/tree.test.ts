@@ -183,6 +183,78 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
     expect(plan.pids).toEqual([2001, 2002]);
   });
 
+
+  test("an ancestor row missing from the table never puts its group in groups", () => {
+    const table = [
+      row(1, 0, 1),
+      row(300, 1, 300),
+      // 400 (our parent) is absent: ps dropped its row
+      row(SELF, 400, SELF),
+      row(1000, 300, 1000),
+      row(2000, 1000, 2000),
+      row(2001, 2000, 400),
+      row(2002, 2001, 400),
+    ];
+    const plan = planTreeKill(1000, table, SELF)!;
+    expect(plan.refused).toBeUndefined();
+    expect(plan.groups).toEqual([2000]);
+    expect(plan.pids).toEqual([2001, 2002]);
+  });
+
+  test("an ancestor printed with an empty comm is parsed, and its group is not signaled whole", () => {
+    const raw = [
+      "    1     0     1 init",
+      "  300     1   300 sup",
+      "  400   300   400 ",
+      "  500   400   500 self",
+      " 1000   300  1000 root",
+      " 2000  1000  2000 sh",
+      " 2001  2000   400 job",
+      " 2002  2001   400 job",
+    ].join("\n");
+    const plan = planTreeKill(1000, parseProcTable(raw), SELF)!;
+    expect(plan.groups).toEqual([2000]);
+    expect(plan.pids).toEqual([2001, 2002]);
+  });
+
+  test("a group that holds our own pid is never signaled whole, even with our row's pgid elsewhere", () => {
+    // 2001 sits in a group led by our pid. Our pid's group must not be signaled.
+    const table = [...BASE, row(1000, 1, 1000), row(2000, 1000, 2000), row(2001, 2000, SELF)];
+    const plan = planTreeKill(1000, table, SELF)!;
+    expect(plan.groups).toEqual([2000]);
+    expect(plan.pids).toEqual([2001]);
+  });
+
+  test("rootLedGroup: an exited root's surviving group still leads to its children", () => {
+    const table = [
+      ...BASE,
+      row(1001, 1, 1000), // left in the exited root's group, now owned by init
+      row(1500, 1001, 1500), // its child, in a group of its own
+    ];
+    const plan = planTreeKill(1000, table, SELF, { rootLedGroup: true })!;
+    expect(plan.refused).toBeUndefined();
+    expect(plan.rootPid).toBe(1000);
+    expect(plan.groups).toEqual([1500]);
+    expect(plan.pids).toEqual([]);
+  });
+
+  test("without rootLedGroup an absent root still returns null", () => {
+    const table = [...BASE, row(1001, 1, 1000), row(1500, 1001, 1500)];
+    expect(planTreeKill(1000, table, SELF)).toBeNull();
+    expect(planTreeKill(1000, table, SELF, { rootLedGroup: false })).toBeNull();
+  });
+
+  test("rootLedGroup with no surviving group member returns null", () => {
+    expect(planTreeKill(1000, [...BASE, row(2000, 1, 2000)], SELF, { rootLedGroup: true })).toBeNull();
+  });
+
+  test("rootLedGroup keeps every refusal: we run under a surviving member, pid 1, our own pid", () => {
+    expect(planTreeKill(1000, [row(1, 0, 1), row(1001, 1, 1000), row(SELF, 1001, SELF)], SELF, { rootLedGroup: true })!.refused)
+      .toBe("this process is inside the tree");
+    expect(planTreeKill(1, BASE, SELF, { rootLedGroup: true })!.refused).toMatch(/never signaled/);
+    expect(planTreeKill(SELF, BASE, SELF, { rootLedGroup: true })!.refused).toMatch(/this process/);
+  });
+
   test("a root whose group holds one of our ancestors is refused", () => {
     const table = [
       row(1, 0, 1),
@@ -191,7 +263,7 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
       row(1000, 1, 1000),
     ];
     const plan = planTreeKill(1000, table, SELF)!;
-    expect(plan.refused).toMatch(/inside the tree/); // we are below that ancestor
+    expect(plan.refused).toBe("this process is inside the tree"); // we are below that ancestor, so the self check fires
     expect(plan.groups).toEqual([]);
     expect(plan.pids).toEqual([]);
   });
@@ -200,6 +272,18 @@ describe("planTreeKill: which groups and pids a tree kill signals", () => {
 describe("groupOnlyPlan", () => {
   test("signals the root's group alone", () => {
     expect(groupOnlyPlan(1234)).toEqual({ rootPid: 1234, groups: [], pids: [] });
+  });
+  test("refuses our own pid and, by default, our parent's", () => {
+    expect(groupOnlyPlan(process.pid).refused).toMatch(/this process/);
+    expect(groupOnlyPlan(process.ppid).refused).toMatch(/parent/);
+    const os = fakeOs(TREE);
+    expect(signalTree(groupOnlyPlan(process.pid), "SIGTERM", os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(signalTree(groupOnlyPlan(process.ppid), "SIGTERM", os.kill)).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(os.calls).toEqual([]);
+  });
+  test("an explicit selfPid is refused, and an unrelated pid is not", () => {
+    expect(groupOnlyPlan(777, 777).refused).toMatch(/this process/);
+    expect(groupOnlyPlan(777, 888)).toEqual({ rootPid: 777, groups: [], pids: [] });
   });
   test("refuses pid 1 and below", () => {
     for (const pid of [1, 0, -5, Number.NaN]) {
@@ -226,7 +310,7 @@ describe("parseProcTable", () => {
     const raw = [
       "  PID  PPID  PGID COMM", // header
       "  101     1", // short row
-      "  102     1   102", // no comm
+      "  102     1", // short row
       "  abc   def   ghi node", // non-numeric
       "  1x    2   3 node",
       "",
@@ -235,6 +319,14 @@ describe("parseProcTable", () => {
     ].join("\n");
     expect(parseProcTable(raw)).toEqual([row(200, 101, 101, "sh")]);
     expect(parseProcTable("")).toEqual([]);
+  });
+
+  test("a row with an empty or blank comm is kept, since pid, ppid and pgid carry the safety", () => {
+    expect(parseProcTable("  102     1   102\n  103     1   103    \n  104 1 104 \t \n")).toEqual([
+      row(102, 1, 102, ""),
+      row(103, 1, 103, ""),
+      row(104, 1, 104, ""),
+    ]);
   });
 });
 
@@ -342,7 +434,7 @@ describe("signalTree", () => {
     const r = signalTree(plan(), "SIGTERM", kill);
     expect(os.calls).toEqual([]);
     expect(r).toEqual({ signaled: [], denied: [-1000], gone: [] });
-    expect(killTreeSurvivors(plan(), kill)).toEqual({ signaled: [], denied: [-1000], gone: [] });
+    expect(killTreeSurvivors(plan(), kill, r)).toEqual({ signaled: [], denied: [], gone: [] });
   });
 
   test("a refused plan signals nothing", () => {
@@ -385,6 +477,47 @@ describe("signalTree", () => {
     const r = signalTree(plan(), "SIGTERM", kill);
     expect(r.signaled).toEqual([]);
     expect(r.denied).toEqual([-1000]); // a root that cannot be signaled stops the pass
+  });
+});
+
+describe("killTreeSurvivors after a clean first pass", () => {
+  test("a root-group EPERM on the SIGKILL pass does not stop the other survivors", () => {
+    const os = fakeOs(TREE);
+    const p = planTreeKill(1000, TREE, SELF)!;
+    const first = signalTree(p, "SIGTERM", os.kill);
+    expect(first.signaled).toEqual([-1000, -2000]);
+    const kill: KillFn = (t, s) => {
+      if (t === -1000) throw errno("EPERM"); // a member we may not signal now keeps the root group alive
+      os.kill(t, s);
+    };
+    const r = killTreeSurvivors(p, kill, first);
+    expect(r.denied).toEqual([-1000]);
+    expect(r.signaled).toEqual([-2000]);
+    expect(os.live.has(2002)).toBe(false);
+  });
+
+  test("a first pass that was denied on the root group means nothing is sent", () => {
+    const os = fakeOs(TREE);
+    const p = planTreeKill(1000, TREE, SELF)!;
+    const r = killTreeSurvivors(p, os.kill, { signaled: [], denied: [-1000], gone: [] });
+    expect(r).toEqual({ signaled: [], denied: [], gone: [] });
+    expect(os.calls).toEqual([]);
+  });
+});
+
+describe("a kill that throws something odd", () => {
+  test("never throws out of signalTree, killTreeSurvivors or processGroupAlive", () => {
+    const p = planTreeKill(1000, TREE, SELF)!;
+    for (const thrown of [undefined, null, 7, "boom"]) {
+      const kill: KillFn = () => {
+        throw thrown;
+      };
+      expect(() => signalTree(p, "SIGTERM", kill)).not.toThrow();
+      expect(() => killTreeSurvivors(p, kill)).not.toThrow();
+      expect(() => processGroupAlive(1234, kill)).not.toThrow();
+      expect(signalTree(p, "SIGTERM", kill).denied).toEqual([-1000]);
+      expect(processGroupAlive(1234, kill)).toBe(false);
+    }
   });
 });
 
