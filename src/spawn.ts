@@ -67,8 +67,9 @@ export interface SupervisedOptions {
    */
   graceMs?: number;
   /**
-   * Bound, in ms, on the one `ps` read each kill plans from. Default 2000. 0 or
-   * less skips the snapshot, and only the child's own process group is
+   * Bound, in ms, on each `ps` read a kill plans from (one, or two when the
+   * child exits while the first runs). Default 2000. 0 or less skips the
+   * snapshot, and only the child's own process group is
    * signaled (a descendant in a group or session of its own is not reached).
    */
   snapshotTimeoutMs?: number;
@@ -140,7 +141,8 @@ export type KillTreeOutcome = "done" | "denied" | "gone";
  * does not exit before the survivors get their SIGKILL.
  *
  * Throws whatever `child_process.spawn` throws synchronously (invalid
- * arguments). A command that cannot be started rejects `done` instead.
+ * arguments), and whatever `openPromptStdin` throws when `prompt` is set (it
+ * writes a temporary file). A command that cannot be started rejects `done` instead.
  */
 export function spawnSupervised(command: string, args: string[], opts: SupervisedOptions = {}): Supervised {
   const graceMs = graceOf(opts.graceMs);
@@ -205,8 +207,11 @@ export function spawnSupervised(command: string, args: string[], opts: Supervise
  * then SIGKILL to the survivors of the same plan. The root should lead its own
  * process group (spawned detached), since its group is signaled whole.
  *
- * A root that is this process, leads or sits in its group, has it beneath it,
- * or is 1 or less is refused, and nothing is signaled. So is any root when
+ * A root that is this process, leads or sits in its group, has it beneath it
+ * (which covers this process's parent), or is 1 or less is refused, and
+ * nothing is signaled. The one exception: when a trusted snapshot shows
+ * nothing of the root or its group, the result is `"gone"` before any of those
+ * checks run, and nothing is signaled either. So is any root refused when
  * the snapshot does not show this process's ancestors back to pid 1. If the
  * snapshot no longer shows the root itself, the plan starts from the members
  * its process group still has (POSIX never reuses a pid while a group with
@@ -280,9 +285,12 @@ async function reapChild(
   // If the child exited while ps ran, this table cannot tell the child's row
   // from a reused pid. Read it again, now that the child is known to be gone.
   if (wasRunning && !running()) table = await snapshotProcessTableAsync(snapshotTimeoutMs);
-  // No await from here until the first signal is out. Node collects an exited
-  // child (freeing its pid for reuse) only on the event loop, so a child seen
-  // running now is still ours when killPlan sends that signal.
+  // No await from here until the first signal is out, so a child seen running
+  // now is still ours when killPlan sends that signal. Node collects exited
+  // children in one pass and then runs their exit callbacks oldest first,
+  // draining microtasks in between. The check above resumes after a ps child
+  // that was spawned later than ours, so by the time it runs, our own exit has
+  // already been recorded (running() is false) if our child had been collected.
   const plan = planChildKill(pid, table, running());
   if (!plan) return 0;
   const { first } = await killPlan(plan, signal, graceMs);
